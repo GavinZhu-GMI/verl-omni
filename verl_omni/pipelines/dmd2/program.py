@@ -31,6 +31,8 @@ from verl.utils import tensordict_utils as tu
 from verl_omni.trainer.diffusion.distillation.utils import standard_cfg, timestep_shift, velocity_to_x0
 from verl_omni.workers.config.diffusion.dmd import DiffusionDMDConfig
 
+__all__ = ["DMD2Program", "backward_simulation", "re_noise", "shifted_sigmas"]
+
 
 def shifted_sigmas(time: float | Tensor, shifts: dict[str, float], device: torch.device) -> dict[str, Tensor]:
     """Apply each modality's rational shift on the normalized [0, 1] grid in FP32."""

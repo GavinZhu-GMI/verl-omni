@@ -55,10 +55,12 @@ score_time_min: 0.02
 # Upper continuous base-time bound, before DMD2Program's per-modality shifts.
 score_time_max: 0.98
 
-# Lower score sigma bound.
+# Lower sigma bound reserved for future discrete score sampling.
+# Unused by DMD2Program; keep the default and use score_time_min instead.
 score_sigma_min: 0.02
 
-# Upper score sigma bound.
+# Upper sigma bound reserved for future discrete score sampling.
+# Unused by DMD2Program; keep the default and use score_time_max instead.
 score_sigma_max: 0.98
 
 # Discrete score timestep shift.
