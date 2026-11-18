@@ -58,14 +58,32 @@ class DiffusionDMDConfig(BaseConfig):
     surrogate_scale: float = 0.5
     # Per-sample clamp on the student and fake-score losses; None disables it, PDMD uses 5.0.
     loss_clamp: Optional[float] = None
+    # DMD2Program generator sampler: deterministic Euler (the PDMD reference), or x0 then fresh noise at
+    # the next knot. The served sampler must match the one trained.
+    sampler: str = "euler"
+    # Base-time knots from 1 (noise) to 0 (clean), num_inference_steps + 1 of them, before modality shifts.
+    # None selects the uniform grid linspace(1, 0, num_inference_steps + 1).
+    base_time_knots: Optional[list[float]] = None
+    # Noise that re-noises the student's x0 at the score query: the student's own noise estimate (the PDMD
+    # reference), the rollout's initial noise (Euler only), or a fresh Gaussian (as the PDMD paper's Eq. 1).
+    score_query_noise: str = "student_estimate"
+    # Noise that re-noises the rollout endpoint for the fake score: a fresh Gaussian (the PDMD reference)
+    # or the rollout's initial noise (Euler only), which pairs with trajectory query noise.
+    critic_noise: str = "fresh"
+    # Fake-score time law: per-sample U(0, 1) per modality with the lead-modality rule below (the PDMD
+    # reference), or the student's score-query law on the training grid, which matches the queries on a
+    # shifted grid.
+    critic_time: str = "uniform"
+    # Lead modality of the uniform critic-time rule; required with several modalities.
+    critic_time_lead_modality: Optional[str] = None
+    # Lead sigma above which every other modality redraws its critic sigma from U(floor, 1); PDMD uses 0.95.
+    critic_time_lead_threshold: float = 0.95
+    # Lower bound of that redraw; PDMD uses 0.85.
+    critic_time_follower_floor: float = 0.85
     # Fixed rational shift applied once to the inference sigma grid.
     rollout_timestep_shift: float = 3.0
     # Discrete score grid size; zero selects continuous score sampling.
     score_discrete_steps: int = 1000
-    # Lower continuous base-time bound, before DMD2Program's per-modality shifts.
-    score_time_min: float = 0.02
-    # Upper continuous base-time bound, before DMD2Program's per-modality shifts.
-    score_time_max: float = 0.98
     # Lower score sigma bound.
     score_sigma_min: float = 0.02
     # Upper score sigma bound.
@@ -109,8 +127,6 @@ class DiffusionDMDConfig(BaseConfig):
             "teacher_guidance_scale",
             "normalization_epsilon",
             "rollout_timestep_shift",
-            "score_time_min",
-            "score_time_max",
             "score_sigma_min",
             "score_sigma_max",
             "score_timestep_shift",
@@ -140,9 +156,43 @@ class DiffusionDMDConfig(BaseConfig):
             raise ValueError(f"loss_clamp must be None or finite and positive, got {self.loss_clamp!r}")
         if self.rollout_timestep_shift < 1 or self.score_timestep_shift < 1:
             raise ValueError("rollout_timestep_shift and score_timestep_shift must be at least 1")
-        for prefix in ("score_sigma", "score_time"):
-            if not 0 < getattr(self, f"{prefix}_min") < getattr(self, f"{prefix}_max") <= 1:
-                raise ValueError(f"{prefix} bounds must satisfy 0 < {prefix}_min < {prefix}_max <= 1")
+        if not 0 < self.score_sigma_min < self.score_sigma_max <= 1:
+            raise ValueError("score_sigma bounds must satisfy 0 < score_sigma_min < score_sigma_max <= 1")
+        for name, valid in (
+            ("sampler", {"euler", "renoise"}),
+            ("score_query_noise", {"student_estimate", "trajectory", "fresh"}),
+            ("critic_noise", {"fresh", "trajectory"}),
+            ("critic_time", {"uniform", "query_matched"}),
+        ):
+            if getattr(self, name) not in valid:
+                raise ValueError(f"Invalid {name}: {getattr(self, name)}. Must be one of {sorted(valid)}")
+        if self.sampler == "renoise" and "trajectory" in (self.score_query_noise, self.critic_noise):
+            raise ValueError(
+                "trajectory noise needs sampler=euler: with renoise the initial noise does not determine x0"
+            )
+        knots = self.base_time_knots
+        if knots is not None:
+            if (
+                not isinstance(knots, list | tuple)
+                or len(knots) != self.num_inference_steps + 1
+                or any(isinstance(k, bool) or not isinstance(k, int | float) or not math.isfinite(k) for k in knots)
+                or knots[0] != 1
+                or knots[-1] != 0
+                or any(a <= b for a, b in zip(knots, knots[1:], strict=False))
+            ):
+                raise ValueError(
+                    "base_time_knots must be num_inference_steps + 1 finite numbers, strictly decreasing from 1 to 0"
+                )
+        threshold, floor = self.critic_time_lead_threshold, self.critic_time_follower_floor
+        if isinstance(threshold, bool) or not isinstance(threshold, int | float) or not 0 <= threshold <= 1:
+            raise ValueError(f"critic_time_lead_threshold must lie in [0, 1], got {threshold!r}")
+        if isinstance(floor, bool) or not isinstance(floor, int | float) or not 0 <= floor < 1:
+            raise ValueError(f"critic_time_follower_floor must lie in [0, 1), got {floor!r}")
+        lead = self.critic_time_lead_modality
+        if lead is not None and lead not in self.modality_shifts:
+            raise ValueError(f"critic_time_lead_modality {lead!r} is not one of {sorted(self.modality_shifts)}")
+        if self.critic_time == "uniform" and len(self.modality_shifts) > 1 and lead is None:
+            raise ValueError("critic_time=uniform with several modalities needs critic_time_lead_modality")
         if not 0 <= self.ema_decay <= 1:
             raise ValueError("ema_decay must be between 0 and 1")
         valid_cfg_norms = {"none", "layer_norm", "scalar"}

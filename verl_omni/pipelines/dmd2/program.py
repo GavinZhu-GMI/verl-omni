@@ -12,93 +12,98 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Continuous-flow DMD2 computation using caller-owned velocity predictors.
+"""Continuous-flow DMD2 / PDMD computation using caller-owned velocity predictors.
 
 This module constructs inputs for the registered DMDLoss. Model construction,
 parameter updates, distributed contexts and checkpoint publication stay with
 the caller. No model adapter or training engine is imported here.
+
+Noise-time convention: sigma=1 is pure noise, x_sigma = (1 - sigma) * x0 + sigma * z,
+and the predicted velocity is v = z - x0.
 """
 
 from collections.abc import Callable
-from contextlib import nullcontext
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import torch
 from tensordict import TensorDict
 from torch import Tensor
 from verl.utils import tensordict_utils as tu
 
-from verl_omni.trainer.diffusion.distillation.utils import standard_cfg, timestep_shift, velocity_to_x0
+from verl_omni.trainer.diffusion.distillation.utils import standard_cfg, velocity_to_x0
 from verl_omni.workers.config.diffusion.dmd import DiffusionDMDConfig
 
-__all__ = ["DMD2Program", "backward_simulation", "re_noise", "shifted_sigmas"]
+__all__ = ["DMD2Program", "Trajectory", "training_grid"]
 
 
-def shifted_sigmas(time: float | Tensor, shifts: dict[str, float], device: torch.device) -> dict[str, Tensor]:
-    """Apply each modality's rational shift on the normalized [0, 1] grid in FP32."""
-    time = torch.as_tensor(time, dtype=torch.float32, device=device)
-    return {name: timestep_shift(time, num_train_timesteps=1, shift=shift) for name, shift in shifts.items()}
+@dataclass
+class Trajectory:
+    """A no-grad student rollout.
 
-
-def re_noise(clean: dict[str, Tensor], sigmas: dict[str, Tensor]) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-    """Return detached noisy samples and Gaussian noise, preserving ``(B, ...)`` shapes."""
-    noise = {name: torch.randn_like(value, dtype=torch.float32) for name, value in clean.items()}
-    noisy = {
-        name: (1 - sigmas[name]) * value.detach().float() + sigmas[name] * noise[name] for name, value in clean.items()
-    }
-    return noisy, noise
-
-
-def backward_simulation(
-    predict: Callable[[dict[str, Tensor], dict[str, Tensor]], dict[str, Tensor]],
-    initial: dict[str, Tensor],
-    shifts: dict[str, float],
-    steps: int,
-    exit_step: int,
-    *,
-    require_grad: bool,
-) -> dict[str, Tensor]:
-    """Predict clean FP32 samples, retaining gradients only at the selected exit.
-
-    ``initial`` contains standard Gaussian noise of shape ``(B, ...)`` per
-    modality. ``predict`` returns flow velocities with the same keys and shapes.
-    The caller validates model-specific layouts before entering this sampler.
+    ``states`` holds ``num_inference_steps + 1`` dicts of FP32 ``(B, ...)`` latents per modality:
+    ``states[0]`` is the initial noise and ``states[-1]`` the generated endpoint. ``sigmas`` holds each
+    modality's FP32 training grid of shape ``(num_inference_steps + 1,)``, from 1 to 0.
     """
-    if not 0 <= exit_step < steps:
-        raise ValueError("exit_step must index an inference step")
-    latents = {name: value.detach().float() for name, value in initial.items()}
-    device = next(iter(latents.values())).device
-    for index in range(exit_step + 1):
-        sigmas = shifted_sigmas(1 - index / steps, shifts, device)
-        context = nullcontext() if require_grad and index == exit_step else torch.no_grad()
-        with context:
-            velocities = predict(latents, sigmas)
-            clean = {name: velocity_to_x0(value, velocities[name], sigmas[name]) for name, value in latents.items()}
-        if index != exit_step:
-            next_sigmas = shifted_sigmas(1 - (index + 1) / steps, shifts, device)
-            latents, _ = re_noise(clean, next_sigmas)
-    return clean
+
+    states: list[dict[str, Tensor]]
+    sigmas: dict[str, Tensor]
+
+
+def training_grid(config: DiffusionDMDConfig, device: torch.device) -> dict[str, Tensor]:
+    """Shift the base-time knots per modality in FP64, then return FP32 grids of shape ``(N + 1,)``.
+
+    The shift is written out rather than taken from ``timestep_shift``, which works in FP32: the PDMD
+    reference shifts in FP64, and its grids must match bit for bit.
+    """
+    steps = config.num_inference_steps
+    if config.base_time_knots is None:
+        knots = torch.linspace(1, 0, steps + 1, dtype=torch.float64)
+    else:
+        knots = torch.tensor(config.base_time_knots, dtype=torch.float64)
+    return {
+        name: (shift * knots / (1 + (shift - 1) * knots)).float().to(device)
+        for name, shift in config.modality_shifts.items()
+    }
+
+
+def _per_sample(sigma: Tensor, like: Tensor) -> Tensor:
+    """View a ``(B,)`` sigma so it broadcasts over a ``(B, ...)`` latent."""
+    return sigma.view(-1, *([1] * (like.ndim - 1)))
+
+
+def _renoise(clean: Tensor, noise: Tensor, sigma: Tensor) -> Tensor:
+    """Forward process at a per-sample ``(B,)`` sigma, in FP32."""
+    sigma = _per_sample(sigma, clean)
+    return (1 - sigma) * clean.float() + sigma * noise.float()
+
+
+def _endpoint(latents: Tensor, velocity: Tensor, sigma: Tensor) -> Tensor:
+    """x0 estimate from a velocity prediction at a per-sample ``(B,)`` sigma."""
+    return velocity_to_x0(latents, velocity, _per_sample(sigma, latents))
+
+
+def _interval_sigma(grid: Tensor, step: Tensor | int, ratio: Tensor) -> Tensor:
+    """``grid[step + 1] + ratio * (grid[step] - grid[step + 1])``: a point inside the step below ``step``."""
+    return grid[step + 1] + ratio * (grid[step] - grid[step + 1])
 
 
 class DMD2Program:
-    """Compute DMD2 stages with a model-independent velocity callback.
+    """Compute DMD2 / PDMD stages with a model-independent velocity callback.
 
     Args:
-        config: Continuous score sampling with explicit modality shifts/weights.
-            ``score_time_min/max`` bound the base time before modality shifts.
-            The scalar shift and ``score_sigma_min/max`` fields are unused here
-            and must retain their defaults.
-        predict: ``predict(role, latents, sigmas, negative)`` returning matching
-            velocity tensors. It captures conditions and caller-owned models.
-            Roles are ``student``, ``fake_score`` and ``teacher``; ``negative``
-            selects unconditional teacher inputs for CFG. With teacher
-            ``layer_norm`` CFG, both inputs and outputs must be packed
-            ``(B, tokens, features)``; the last axis is the feature vector.
-        seed: Seed for the exit-selection RNG, shared across cooperating ranks.
+        config: Continuous score sampling with explicit modality shifts and weights. The scalar
+            shifts and ``score_sigma_min/max`` are unused here and must keep their defaults.
+        predict: ``predict(role, latents, sigmas, negative)`` returning velocities with the
+            latents' keys and shapes. ``sigmas`` maps each modality to a per-sample FP32 ``(B,)``
+            tensor. Roles are ``student``, ``fake_score`` and ``teacher``; ``negative`` selects
+            unconditional teacher inputs for CFG. With teacher ``layer_norm`` CFG, inputs and
+            outputs must be packed ``(B, tokens, features)``.
+        seed: Seed for the exit-index RNG, shared across cooperating ranks.
 
-    The caller saves the global CPU RNG (score time) and each used device RNG
-    (tensor noise) alongside ``state_dict``. The seed controls only exit selection.
-    Forward/recompute contexts and gradient reduction remain caller-owned.
+    The caller saves the global CPU RNG (score and critic times) and each used device RNG
+    (noise) alongside ``state_dict``. Forward/recompute contexts and gradient reduction remain
+    caller-owned.
     """
 
     def __init__(
@@ -111,12 +116,9 @@ class DMD2Program:
             raise ValueError("DMD2Program supports continuous score sampling only; set score_discrete_steps=0")
         if not config.modality_shifts:
             raise ValueError("DMD2Program requires explicit modality_shifts and modality_weights")
-        for name in ("rollout_timestep_shift", "score_timestep_shift"):
+        for name in ("rollout_timestep_shift", "score_timestep_shift", "score_sigma_min", "score_sigma_max"):
             if getattr(config, name) != getattr(DiffusionDMDConfig, name):
-                raise ValueError(f"DMD2Program uses modality_shifts; leave legacy {name} at its default")
-        for name in ("score_sigma_min", "score_sigma_max"):
-            if getattr(config, name) != getattr(DiffusionDMDConfig, name):
-                raise ValueError(f"DMD2Program uses pre-shift score_time_min/max; leave {name} at its default")
+                raise ValueError(f"DMD2Program does not read {name}; leave it at its default")
         self.config = config
         self.predict = predict
         self.control_rng = torch.Generator().manual_seed(seed)
@@ -133,6 +135,10 @@ class DMD2Program:
         """Restore exit selection without modifying the global CPU or device RNGs."""
         self.control_rng.set_state(state["control_rng"])
 
+    def draw_exit_index(self) -> int:
+        """Draw the student exit index for one update; every microbatch and rank of the update shares it."""
+        return int(torch.randint(self.config.num_inference_steps, (), generator=self.control_rng))
+
     def _predict(
         self, role: str, latents: dict[str, Tensor], sigmas: dict[str, Tensor], negative: bool = False
     ) -> dict[str, Tensor]:
@@ -143,7 +149,7 @@ class DMD2Program:
             raise ValueError("Velocity predictions must have the same shapes as the latents")
         return predictions
 
-    def _sample(self, initial: dict[str, Tensor], *, require_grad: bool, final: bool = False) -> dict[str, Tensor]:
+    def _check_latents(self, initial: dict[str, Tensor]) -> None:
         if initial.keys() != self.config.modality_shifts.keys():
             raise ValueError("Latent modalities must match modality_shifts and modality_weights")
         first = next(iter(initial.values()))
@@ -156,69 +162,153 @@ class DMD2Program:
             for value in initial.values()
         ):
             raise ValueError("Latents require nonempty floating (B, ...) tensors with a shared batch size and device")
-        exit_step = (
-            self.config.num_inference_steps - 1
-            if final
-            else int(torch.randint(self.config.num_inference_steps, (), generator=self.control_rng))
-        )
-        return backward_simulation(
-            lambda latents, sigmas: self._predict("student", latents, sigmas),
-            initial,
-            self.config.modality_shifts,
-            self.config.num_inference_steps,
-            exit_step,
-            require_grad=require_grad,
-        )
 
-    def stage_outputs(self, initial: dict[str, Tensor], stage: str) -> dict[str, dict[str, Tensor]]:
-        """Construct loss inputs using one shared base score time per microbatch.
+    @torch.no_grad()
+    def rollout(self, initial: dict[str, Tensor]) -> Trajectory:
+        """Run the student for all ``num_inference_steps`` without autograd and keep every state.
 
-        Each modality transforms that scalar with its own shift. This intentionally
-        shares time across samples, unlike per-sample score-time sampling.
+        ``initial`` holds standard Gaussian noise of shape ``(B, ...)`` per modality. ``euler`` steps along
+        the predicted velocity; ``renoise`` jumps to the predicted x0 and adds fresh noise (global device
+        RNG) at the next knot.
         """
-        if stage not in {"student", "fake_score"}:
-            raise ValueError(f"Unknown DMD stage {stage!r}")
-        if stage == "student" and self.config.teacher_guidance_scale != 1 and self.config.cfg_norm == "layer_norm":
-            if any(value.ndim != 3 for value in initial.values()):
+        self._check_latents(initial)
+        first = next(iter(initial.values()))
+        batch, device = first.shape[0], first.device
+        grid = training_grid(self.config, device)
+        state = {name: value.detach().float() for name, value in initial.items()}
+        states = [state]
+        for index in range(self.config.num_inference_steps):
+            current = {name: grid[name][index] for name in state}
+            following = {name: grid[name][index + 1] for name in state}
+            velocities = self._predict("student", state, {name: sigma.repeat(batch) for name, sigma in current.items()})
+            if self.config.sampler == "euler":
+                state = {
+                    name: value + (following[name] - current[name]) * velocities[name].float()
+                    for name, value in state.items()
+                }
+            elif self.config.sampler == "renoise":
+                clean = {name: value - current[name] * velocities[name].float() for name, value in state.items()}
+                state = {
+                    name: (1 - following[name]) * value + following[name] * torch.randn_like(value)
+                    for name, value in clean.items()
+                }
+            else:
+                raise ValueError(f"Unknown sampler {self.config.sampler!r}")
+            states.append(state)
+        return Trajectory(states=states, sigmas=grid)
+
+    def _critic_sigmas(self, trajectory: Trajectory) -> dict[str, Tensor]:
+        """Per-sample fake-score sigmas, drawn on the global CPU RNG."""
+        batch = next(iter(trajectory.states[0].values())).shape[0]
+        device = next(iter(trajectory.sigmas.values())).device
+        names = list(self.config.modality_shifts)
+        if self.config.critic_time == "uniform":
+            lead = self.config.critic_time_lead_modality or names[0]
+            lead_sigma = torch.rand(batch)
+            sigmas = {lead: lead_sigma}
+            floor = self.config.critic_time_follower_floor
+            for name in names:
+                if name == lead:
+                    continue
+                draw, redraw = torch.rand(batch), torch.rand(batch)
+                sigmas[name] = torch.where(
+                    lead_sigma > self.config.critic_time_lead_threshold, floor + (1 - floor) * redraw, draw
+                )
+        elif self.config.critic_time == "query_matched":
+            step = torch.randint(self.config.num_inference_steps, (batch,)).to(device)
+            ratio = torch.rand(batch).to(device)
+            sigmas = {name: _interval_sigma(trajectory.sigmas[name], step, ratio) for name in names}
+        else:
+            raise ValueError(f"Unknown critic_time {self.config.critic_time!r}")
+        return {name: sigmas[name].to(device) for name in names}
+
+    def _fake_score_outputs(self, trajectory: Trajectory) -> dict[str, dict[str, Tensor]]:
+        endpoint = trajectory.states[-1]
+        sigmas = self._critic_sigmas(trajectory)
+        if self.config.critic_noise == "fresh":
+            noise = {name: torch.randn_like(value) for name, value in endpoint.items()}
+        elif self.config.critic_noise == "trajectory":
+            noise = trajectory.states[0]
+        else:
+            raise ValueError(f"Unknown critic_noise {self.config.critic_noise!r}")
+        noisy = {name: _renoise(value, noise[name], sigmas[name]) for name, value in endpoint.items()}
+        prediction = self._predict("fake_score", noisy, sigmas)
+        return {
+            name: {"generated_x0": value, "noise_pred": prediction[name], "noise": noise[name]}
+            for name, value in endpoint.items()
+        }
+
+    def _student_outputs(self, trajectory: Trajectory, exit_index: Optional[int]) -> dict[str, dict[str, Tensor]]:
+        steps = self.config.num_inference_steps
+        if isinstance(exit_index, bool) or not isinstance(exit_index, int) or not 0 <= exit_index < steps:
+            raise ValueError(f"The student stage needs an integer exit_index in [0, {steps}), got {exit_index!r}")
+        start = trajectory.states[exit_index]
+        if self.config.teacher_guidance_scale != 1 and self.config.cfg_norm == "layer_norm":
+            if any(value.ndim != 3 for value in start.values()):
                 raise ValueError(
                     "Teacher layer_norm CFG requires packed (B, tokens, features) latents and velocities; "
                     "pack the latents before calling the program or use cfg_norm='none'/'scalar'"
                 )
-        generated = self._sample(initial, require_grad=stage == "student")
-        time = torch.empty((), dtype=torch.float32, device="cpu").uniform_(
-            self.config.score_time_min, self.config.score_time_max
-        )
-        sigmas = shifted_sigmas(time, self.config.modality_shifts, next(iter(initial.values())).device)
-        noisy, noise = re_noise(generated, sigmas)
-        if stage == "fake_score":
-            prediction = self._predict(stage, noisy, sigmas)
-            return {
-                name: {"generated_x0": value.detach(), "noise_pred": prediction[name], "noise": noise[name]}
-                for name, value in generated.items()
-            }
+        first = next(iter(start.values()))
+        batch, device = first.shape[0], first.device
+        grid = trajectory.sigmas
+        start_sigmas = {name: grid[name][exit_index].repeat(batch) for name in start}
+        velocity = self._predict("student", start, start_sigmas)
+        clean = {name: _endpoint(value, velocity[name], start_sigmas[name]) for name, value in start.items()}
+        ratio = torch.rand(batch).to(device)  # one per sample, shared by every modality
+        query_sigmas = {name: _interval_sigma(grid[name], exit_index, ratio) for name in start}
         with torch.no_grad():
-            fake = self._predict("fake_score", noisy, sigmas)
-            real = self._predict("teacher", noisy, sigmas)
+            if self.config.score_query_noise == "student_estimate":
+                noise = {
+                    name: value.float() + _per_sample(1 - start_sigmas[name], value) * velocity[name].float()
+                    for name, value in start.items()
+                }
+            elif self.config.score_query_noise == "trajectory":
+                noise = trajectory.states[0]
+            elif self.config.score_query_noise == "fresh":
+                noise = {name: torch.randn_like(value) for name, value in clean.items()}
+            else:
+                raise ValueError(f"Unknown score_query_noise {self.config.score_query_noise!r}")
+            query = {name: _renoise(value.detach(), noise[name], query_sigmas[name]) for name, value in clean.items()}
+            fake = self._predict("fake_score", query, query_sigmas)
+            real = self._predict("teacher", query, query_sigmas)
             if self.config.teacher_guidance_scale != 1:
-                negative = self._predict("teacher", noisy, sigmas, negative=True)
+                negative = self._predict("teacher", query, query_sigmas, negative=True)
                 real = {
                     name: standard_cfg(value, negative[name], self.config.teacher_guidance_scale, self.config.cfg_norm)
                     for name, value in real.items()
                 }
-            fake = {name: velocity_to_x0(noisy[name], value, sigmas[name]) for name, value in fake.items()}
-            real = {name: velocity_to_x0(noisy[name], value, sigmas[name]) for name, value in real.items()}
+            fake_x0 = {name: _endpoint(query[name], value, query_sigmas[name]) for name, value in fake.items()}
+            teacher_x0 = {name: _endpoint(query[name], value, query_sigmas[name]) for name, value in real.items()}
         return {
-            name: {"generated_x0": value, "fake_x0": fake[name], "teacher_x0": real[name]}
-            for name, value in generated.items()
+            name: {"generated_x0": value, "fake_x0": fake_x0[name], "teacher_x0": teacher_x0[name]}
+            for name, value in clean.items()
         }
+
+    def stage_outputs(
+        self, trajectory: Trajectory, stage: str, exit_index: Optional[int] = None
+    ) -> dict[str, dict[str, Tensor]]:
+        """Construct the registered loss's inputs for one stage from a stored rollout.
+
+        ``fake_score`` re-noises the rollout endpoint at per-sample critic times and takes no exit
+        index. ``student`` re-runs the student with autograd at ``states[exit_index]``.
+        """
+        if stage == "fake_score":
+            if exit_index is not None:
+                raise ValueError("The fake_score stage trains on the rollout endpoint and takes no exit_index")
+            return self._fake_score_outputs(trajectory)
+        if stage == "student":
+            return self._student_outputs(trajectory, exit_index)
+        raise ValueError(f"Unknown DMD stage {stage!r}")
 
     def compute_loss(
         self,
-        initial: dict[str, Tensor],
+        trajectory: Trajectory,
         stage: str,
         data: TensorDict,
         loss_function: Callable,
         *,
+        exit_index: Optional[int] = None,
         dp_group: Any = None,
     ) -> tuple[Tensor, dict[str, Any], bool]:
         """Call the registered loss per modality; report nonfinite tensors to the caller.
@@ -232,7 +322,7 @@ class DMD2Program:
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"Caller must supply a positive integer {name} for the public loss wrapper")
         tu.assign_non_tensor(data, dmd_stage=stage, dmd_config=self.config)
-        outputs = self.stage_outputs(initial, stage)
+        outputs = self.stage_outputs(trajectory, stage, exit_index)
         loss, metrics, invalid = 0, {}, False
         for modality, output in outputs.items():
             part, part_metrics = loss_function(model_output=output, data=data, dp_group=dp_group)
@@ -241,7 +331,6 @@ class DMD2Program:
             invalid |= any(not bool(torch.isfinite(value).all()) for value in output.values())
         return loss, metrics, invalid or not bool(torch.isfinite(loss.detach()))
 
-    @torch.no_grad()
     def sample(self, initial: dict[str, Tensor]) -> dict[str, Tensor]:
         """Generate final FP32 modality latents without advancing exit-selection RNG."""
-        return self._sample(initial, require_grad=False, final=True)
+        return self.rollout(initial).states[-1]

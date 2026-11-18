@@ -63,6 +63,31 @@ surrogate_scale: 0.5
 # Per-sample clamp on the student and fake-score losses; null disables it, PDMD uses 5.0.
 loss_clamp: null
 
+# DMD2Program generator sampler: euler, or renoise (x0, then fresh noise at the next knot).
+sampler: euler
+
+# Base-time knots from 1 to 0, num_inference_steps + 1 of them, before modality shifts.
+# null selects the uniform grid linspace(1, 0, num_inference_steps + 1).
+base_time_knots: null
+
+# Score-query re-noise: student_estimate, trajectory (initial noise, euler only) or fresh.
+score_query_noise: student_estimate
+
+# Fake-score re-noise of the rollout endpoint: fresh, or trajectory (initial noise, euler only).
+critic_noise: fresh
+
+# Fake-score time law: uniform (with the lead-modality rule) or query_matched.
+critic_time: uniform
+
+# Lead modality of the uniform critic-time rule; required with several modalities.
+critic_time_lead_modality: null
+
+# Lead sigma above which every other modality redraws its critic sigma from U(floor, 1); PDMD uses 0.95.
+critic_time_lead_threshold: 0.95
+
+# Lower bound of that redraw; PDMD uses 0.85.
+critic_time_follower_floor: 0.85
+
 # Fixed inference sigma shift.
 rollout_timestep_shift: 3.0
 
@@ -70,18 +95,10 @@ rollout_timestep_shift: 3.0
 # DMD2Program rejects this default; override to 0 for continuous score sampling.
 score_discrete_steps: 1000
 
-# Lower continuous base-time bound, before DMD2Program's per-modality shifts.
-score_time_min: 0.02
-
-# Upper continuous base-time bound, before DMD2Program's per-modality shifts.
-score_time_max: 0.98
-
-# Lower sigma bound reserved for future discrete score sampling.
-# Unused by DMD2Program; keep the default and use score_time_min instead.
+# Lower sigma bound reserved for future discrete score sampling; unused by DMD2Program.
 score_sigma_min: 0.02
 
-# Upper sigma bound reserved for future discrete score sampling.
-# Unused by DMD2Program; keep the default and use score_time_max instead.
+# Upper sigma bound reserved for future discrete score sampling; unused by DMD2Program.
 score_sigma_max: 0.98
 
 # Discrete score timestep shift.

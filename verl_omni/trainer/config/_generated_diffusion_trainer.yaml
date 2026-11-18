@@ -655,10 +655,16 @@ dmd:
   projection_epsilon: 1.0e-08
   surrogate_scale: 0.5
   loss_clamp: null
+  sampler: euler
+  base_time_knots: null
+  score_query_noise: student_estimate
+  critic_noise: fresh
+  critic_time: uniform
+  critic_time_lead_modality: null
+  critic_time_lead_threshold: 0.95
+  critic_time_follower_floor: 0.85
   rollout_timestep_shift: 3.0
   score_discrete_steps: 1000
-  score_time_min: 0.02
-  score_time_max: 0.98
   score_sigma_min: 0.02
   score_sigma_max: 0.98
   score_timestep_shift: 3.0

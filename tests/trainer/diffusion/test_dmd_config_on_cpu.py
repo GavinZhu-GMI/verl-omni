@@ -66,7 +66,6 @@ class TestDMDConfig:
         assert config.export_role == "student"
         assert config.score_discrete_steps == 1000
         assert (config.score_sigma_min, config.score_sigma_max) == (0.02, 0.98)
-        assert (config.score_time_min, config.score_time_max) == (0.02, 0.98)
         assert isinstance(config.fake_score_optim, FSDPOptimizerConfig)
         assert config.fake_score_optim.lr == pytest.approx(2e-5)
         assert not DiffusionDistillationConfig().enabled
@@ -100,14 +99,6 @@ class TestDMDConfig:
             {"score_sigma_min": 0},
             {"score_sigma_min": 0.9, "score_sigma_max": 0.2},
             {"score_sigma_max": 1.1},
-            {"score_time_min": 0},
-            {"score_time_min": 0.9, "score_time_max": 0.2},
-            {"score_time_min": 0.5, "score_time_max": 0.5},
-            {"score_time_max": 1.1},
-            {"score_time_min": True},
-            {"score_time_max": "0.98"},
-            {"score_time_min": float("nan")},
-            {"score_time_max": float("inf")},
             {"ema_decay": -0.1},
             {"ema_decay": float("nan")},
             {"export_role": "fake_score"},
@@ -116,6 +107,80 @@ class TestDMDConfig:
     def test_invalid_values_fail_closed(self, kwargs):
         with pytest.raises(ValueError):
             DiffusionDMDConfig(**kwargs)
+
+    @pytest.mark.parametrize("field", ["score_time_min", "score_time_max"])
+    def test_removed_score_time_bounds_are_rejected(self, field):
+        with pytest.raises(TypeError, match=field):
+            DiffusionDMDConfig(**{field: 0.5})
+
+    def test_pdmd_sampling_defaults(self):
+        """Defaults are the PDMD reference run's: Euler, uniform grid, noise_hat query, fresh critic noise,
+        uniform critic time with the 0.95 / 0.85 rule."""
+        config = DiffusionDMDConfig()
+        assert config.sampler == "euler"
+        assert config.base_time_knots is None
+        assert config.score_query_noise == "student_estimate"
+        assert config.critic_noise == "fresh"
+        assert config.critic_time == "uniform"
+        assert config.critic_time_lead_modality is None
+        assert (config.critic_time_lead_threshold, config.critic_time_follower_floor) == (0.95, 0.85)
+
+    @pytest.mark.parametrize(
+        "kwargs,match",
+        [
+            ({"sampler": "dpm"}, "sampler"),
+            ({"score_query_noise": "noise_hat"}, "score_query_noise"),
+            ({"critic_noise": "student_estimate"}, "critic_noise"),
+            ({"critic_time": "shifted"}, "critic_time"),
+            ({"sampler": "renoise", "score_query_noise": "trajectory"}, "renoise"),
+            ({"sampler": "renoise", "critic_noise": "trajectory"}, "renoise"),
+            ({"critic_time_lead_threshold": 1.5}, "critic_time_lead_threshold"),
+            ({"critic_time_lead_threshold": float("nan")}, "critic_time_lead_threshold"),
+            ({"critic_time_follower_floor": -0.1}, "critic_time_follower_floor"),
+            ({"critic_time_follower_floor": 1.0}, "critic_time_follower_floor"),
+            ({"critic_time_follower_floor": True}, "critic_time_follower_floor"),
+        ],
+    )
+    def test_invalid_sampling_choices_are_rejected(self, kwargs, match):
+        with pytest.raises(ValueError, match=match):
+            DiffusionDMDConfig(**kwargs)
+
+    @pytest.mark.parametrize(
+        "knots",
+        [
+            [1.0, 0.5, 0.0],  # three knots for four steps
+            [0.9, 0.75, 0.5, 0.25, 0.0],  # does not start at pure noise
+            [1.0, 0.75, 0.5, 0.25, 0.1],  # does not end clean
+            [1.0, 0.75, 0.75, 0.25, 0.0],  # not strictly decreasing
+            [1.0, 0.75, float("nan"), 0.25, 0.0],
+            [1.0, 0.75, True, 0.25, 0.0],
+            "1,0.75,0.5,0.25,0",
+        ],
+    )
+    def test_invalid_base_time_knots_are_rejected(self, knots):
+        with pytest.raises(ValueError, match="base_time_knots"):
+            DiffusionDMDConfig(base_time_knots=knots)
+
+    def test_valid_knots_are_accepted(self):
+        config = DiffusionDMDConfig(num_inference_steps=6, base_time_knots=[1, 0.75, 0.5, 0.25, 0.1, 0.04, 0])
+        assert config.base_time_knots == [1, 0.75, 0.5, 0.25, 0.1, 0.04, 0]
+
+    def test_trajectory_noise_is_valid_with_euler(self):
+        config = DiffusionDMDConfig(score_query_noise="trajectory", critic_noise="trajectory")
+        assert (config.score_query_noise, config.critic_noise) == ("trajectory", "trajectory")
+
+    def test_uniform_critic_time_needs_a_lead_among_several_modalities(self):
+        modalities = {"modality_shifts": {"video": 1.0, "audio": 1.0}, "modality_weights": {"video": 0.8, "audio": 0.8}}
+        with pytest.raises(ValueError, match="critic_time_lead_modality"):
+            DiffusionDMDConfig(**modalities)
+        with pytest.raises(ValueError, match="critic_time_lead_modality"):
+            DiffusionDMDConfig(**modalities, critic_time_lead_modality="image")
+        assert DiffusionDMDConfig(**modalities, critic_time_lead_modality="video").critic_time_lead_modality == "video"
+        assert DiffusionDMDConfig(**modalities, critic_time="query_matched").critic_time_lead_modality is None
+
+    def test_single_modality_needs_no_lead(self):
+        config = DiffusionDMDConfig(modality_shifts={"image": 3.0}, modality_weights={"image": 1.0})
+        assert config.critic_time_lead_modality is None
 
     def test_optimizer_defaults_are_not_shared(self):
         first, second = DiffusionDMDConfig(), DiffusionDMDConfig()
@@ -142,21 +207,26 @@ class TestDMDConfig:
         assert loss.loss_mode == "dmd2"
         assert omega_conf_to_dataclass(config.dmd).fake_update_ratio == 3
 
-    def test_continuous_program_overrides_compose_without_reinterpreting_sigma_bounds(self):
+    def test_pdmd_program_overrides_compose_from_yaml(self):
         from verl_omni.pipelines.dmd2.program import DMD2Program
 
         config = compose_config(
             [
                 "dmd.score_discrete_steps=0",
-                "+dmd.modality_shifts.image=3.0",
-                "+dmd.modality_weights.image=1.0",
-                "dmd.score_time_min=0.15",
-                "dmd.score_time_max=0.6",
+                "+dmd.modality_shifts.video=12.0",
+                "+dmd.modality_shifts.audio=3.0",
+                "+dmd.modality_weights.video=0.8",
+                "+dmd.modality_weights.audio=0.8",
+                "dmd.critic_time_lead_modality=video",
+                "dmd.sampler=renoise",
+                "dmd.num_inference_steps=6",
+                "dmd.base_time_knots=[1.0,0.75,0.5,0.25,0.1,0.04,0.0]",
             ]
         )
         dmd = omega_conf_to_dataclass(config.dmd)
-        assert (dmd.score_time_min, dmd.score_time_max) == (0.15, 0.6)
-        assert (dmd.score_sigma_min, dmd.score_sigma_max) == (0.02, 0.98)
+        assert dmd.sampler == "renoise"
+        assert dmd.base_time_knots == [1.0, 0.75, 0.5, 0.25, 0.1, 0.04, 0.0]
+        assert dmd.critic_time_lead_modality == "video"
         program = DMD2Program(dmd, lambda role, latents, sigmas, negative: latents, seed=42)
         assert program.config is dmd
 

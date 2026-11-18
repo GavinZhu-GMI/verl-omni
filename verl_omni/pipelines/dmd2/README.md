@@ -44,27 +44,40 @@ keys: `+dmd.modality_shifts.image=3.0` and `+dmd.modality_weights.image=1.0`.
 | Fields | Meaning in this program |
 | --- | --- |
 | `num_inference_steps` | Positive integer number of generation steps. |
-| `modality_shifts` | Per-modality rational shifts for generation and score sampling. |
+| `modality_shifts` | Per-modality rational shifts applied to the base-time knots. |
 | `modality_weights` | Per-modality loss weights; keys match the shifts. |
-| `score_time_min/max` | Bounds on uniform base time **before** the score shifts. |
+| `base_time_knots` | `num_inference_steps + 1` knots from 1 to 0 before the shifts; `null` = uniform. |
+| `sampler` | `euler` (along the velocity) or `renoise` (to x0, then fresh noise at the next knot). |
+| `score_query_noise` | `student_estimate`, `trajectory` (initial noise, Euler only) or `fresh`. |
+| `critic_noise` | `fresh` or `trajectory` (initial noise, Euler only). |
+| `critic_time` | `uniform` with the lead-modality rule, or `query_matched`. |
+| `critic_time_lead_modality/threshold`, `critic_time_follower_floor` | Lead-modality rule; the lead is required with several modalities. |
 | `score_discrete_steps` | Must be `0`; discrete score sampling is unsupported here. |
-| `rollout_timestep_shift`, `score_timestep_shift` | Upstream scalar-shift fields, unused here; keep their defaults. |
-| `score_sigma_min/max` | Upstream sigma-bound fields, unused here; keep their defaults. |
+| `rollout_timestep_shift`, `score_timestep_shift`, `score_sigma_min/max` | Upstream fields, unused here; keep their defaults. |
 
-Changing an unused field raises an error pointing to the supported setting.
+Changing an unused field raises an error.
 
-Each stage samples one CPU FP32 `t ~ U(score_time_min, score_time_max)`, shared
-across the microbatch and all modalities. Modality `m` uses
-`sigma_m = shift_m * t / (1 + (shift_m - 1) * t)`. Default time bounds `[0.02, 0.98]`
-with shift 3 give sigma endpoints `[0.05769, 0.99324]` and nonuniform sigma sampling.
-Student-stage fake-score and teacher predictions share the same noisy samples and sigmas.
+`rollout(initial)` runs the student for every step without autograd and returns a
+`Trajectory`: all `num_inference_steps + 1` FP32 states and each modality's grid, from
+fresh standard Gaussian `initial` latents. The grid shifts the knots in FP64, then casts
+to FP32. `sample(initial)` returns the rollout endpoint.
 
-Supply fresh standard Gaussian initial latents for each stage. Generation predicts
-clean samples and re-noises between steps; only the selected student-stage exit
-retains a gradient graph. Fake-score updates detach generated samples; student
-updates detach teacher and fake-score predictions. CFG applies only to the teacher.
+`stage_outputs(trajectory, stage, exit_index)` builds the loss inputs from a stored
+rollout, so a student update can reuse the trajectory of the fake-score update before it.
 
-`compute_loss(initial, stage, data, loss_function, dp_group=...)` returns weighted
+- `fake_score`: re-noise the endpoint `states[-1]` at per-sample critic sigmas with
+  `critic_noise`; the target is `noise - endpoint`. `uniform` draws each sigma from
+  U(0, 1), and when the lead modality's sigma exceeds the threshold, every other modality
+  redraws from U(floor, 1). `query_matched` draws a step `k` and ratio `r` per sample and
+  maps them onto every modality's grid.
+- `student`: re-run the student with autograd at `states[exit_index]` and take its x0.
+  The query sigma is `grid[k + 1] + r * (grid[k] - grid[k + 1])` with one `r` per sample
+  shared by all modalities. The fake score and teacher see the same detached query and
+  sigmas. `draw_exit_index()` draws `k` once per update for every microbatch and rank.
+
+`predict` receives per-sample FP32 `(B,)` sigmas. CFG applies only to the teacher.
+
+`compute_loss(trajectory, stage, data, loss_function, exit_index=..., dp_group=...)` returns weighted
 loss, per-modality metrics, and a nonfinite flag. Bind the public loss wrapper with
 `loss_mode="dmd2"`; supply positive integer `gradient_accumulation_steps` and
 `sp_size` in the `TensorDict`. The wrapper applies these scales once. Use `sp_size=1`
@@ -77,18 +90,16 @@ For resume, each rank saves these RNG states at the same training boundary:
 
 | State | Owner and use |
 | --- | --- |
-| `program.state_dict()` | Private CPU generator for exit selection only. |
-| Global CPU RNG | `torch.get_rng_state()` / `torch.set_rng_state()`; score time, plus any CPU tensor noise. |
-| Used accelerator RNGs | Device backend's `get_rng_state` / `set_rng_state` (or `*_all`); initial noise, re-noising, and model randomness. |
+| `program.state_dict()` | Private CPU generator for exit indices only. |
+| Global CPU RNG | `torch.get_rng_state()` / `torch.set_rng_state()`; score ratios and critic times, plus any CPU tensor noise. |
+| Used accelerator RNGs | Device backend's `get_rng_state` / `set_rng_state` (or `*_all`); initial noise, renoise sampling, fresh query and critic noise, and model randomness. |
 
-`seed` and `load_state_dict()` affect only exit selection. Restore caller-owned CPU,
+`seed` and `load_state_dict()` affect only exit indices. Restore caller-owned CPU,
 device, data-loader and other RNG states after model loading, before sampling the
 next initial latents. Coordinate streams within model-parallel groups and use
-independent streams across data-parallel replicas. RNG restoration does not ensure
+independent streams across data-parallel replicas. Critic times are drawn in `modality_shifts` order and
+noise in the order of the latent dict, so a resumed run must keep both orders. RNG restoration does not ensure
 deterministic backend kernels or reductions.
-
-`sample(initial)` uses the final exit without a gradient graph or advancing the
-exit-selection RNG. It still consumes the caller's noise RNG between steps.
 
 With the repository's normal dependencies installed, run the CPU tests with:
 
