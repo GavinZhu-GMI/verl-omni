@@ -341,7 +341,7 @@ MEGATRON_PINNED_LORA_KEYS = frozenset(
     }
 )
 
-KNOWN_POLICY_STATES = ("default", "old", "reference", "moving_reference")
+KNOWN_POLICY_STATES = ("default", "old", "reference", "moving_reference", "fake_score")
 
 
 @dataclass(frozen=True)

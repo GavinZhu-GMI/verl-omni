@@ -19,6 +19,7 @@ from .diffusers_impl import (  # noqa: F401
     NFTDiffusersFSDPEngine,
     PPODiffusersFSDPEngine,
 )
+from .dmd_impl import DMDDiffusersFSDPEngine  # noqa: F401
 from .omni_impl import OmniFSDPEngine  # noqa: F401
 
 # TODO(andy): unify DPO and NFT engines later.
@@ -29,5 +30,6 @@ __all__ = [
     "DPODiffusersFSDPEngine",
     "NFTDiffusersFSDPEngine",
     "DiffusersFSDPEngine",
+    "DMDDiffusersFSDPEngine",
     "OmniFSDPEngine",
 ]

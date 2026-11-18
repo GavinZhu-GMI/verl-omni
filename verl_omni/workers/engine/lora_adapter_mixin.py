@@ -77,6 +77,25 @@ def apply_lora_dtype(module: torch.nn.Module, target_dtype: torch.dtype) -> None
             submodule.cast_input_dtype_enabled = False
 
 
+def adapter_parameters(module: torch.nn.Module, adapter_name: str) -> list[torch.nn.Parameter]:
+    """Return the PEFT parameters of one named adapter without selecting it.
+
+    ``set_adapter`` also sets ``requires_grad``; selecting by parameter name leaves the active adapter alone.
+
+    Raises:
+        ValueError: The module holds no parameter of ``adapter_name``.
+    """
+    containers = _ADAPTER_MODULE_CONTAINERS + _ADAPTER_PARAMETER_CONTAINERS
+    parameters = []
+    for name, param in module.named_parameters():
+        parts = name.split(".")
+        if any(part in containers and owner == adapter_name for part, owner in zip(parts, parts[1:], strict=False)):
+            parameters.append(param)
+    if not parameters:
+        raise ValueError(f"Adapter {adapter_name!r} has no parameters in this module.")
+    return parameters
+
+
 class LoRAAdapterMixin:
     """Backend-agnostic helpers for named PEFT/LoRA policy adapters."""
 

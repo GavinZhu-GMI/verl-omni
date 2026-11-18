@@ -479,9 +479,11 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         return optimizer
 
     def _build_lr_scheduler(self, optimizer):
-        from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+        return self._lr_scheduler_from(optimizer, self.optimizer_config)
 
-        optim_config = self.optimizer_config
+    def _lr_scheduler_from(self, optimizer, optim_config: FSDPOptimizerConfig):
+        """Build the LR scheduler that ``optim_config`` describes for ``optimizer``."""
+        from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
         total_steps = optim_config.total_training_steps
         num_warmup_steps = optim_config.lr_warmup_steps
@@ -725,15 +727,23 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             grad_norm (float): Norm of gradients before clipping.
         """
         assert self.optimizer_config.clip_grad is not None
+        return self._clip_and_step(self.optimizer, self.module.parameters(), self.optimizer_config.clip_grad)
 
+    def _clip_and_step(self, optimizer, parameters, clip_grad: float) -> float:
+        """Clip the gradients of ``parameters`` to ``clip_grad`` and step ``optimizer``.
+
+        A non-finite norm skips the step and zeroes the optimizer's gradients. Under FSDP1 the module clips all
+        its parameters, whatever ``parameters`` holds.
+
+        Returns:
+            The gradient norm before clipping.
+        """
         if isinstance(self.module, FSDP):
-            grad_norm = self.module.clip_grad_norm_(self.optimizer_config.clip_grad)
+            grad_norm = self.module.clip_grad_norm_(clip_grad)
         elif isinstance(self.module, FSDPModule):
-            grad_norm = fsdp2_clip_grad_norm_(self.module.parameters(), max_norm=self.optimizer_config.clip_grad)
+            grad_norm = fsdp2_clip_grad_norm_(parameters, max_norm=clip_grad)
         else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.module.parameters(), max_norm=self.optimizer_config.clip_grad
-            )
+            grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm=clip_grad)
 
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
@@ -741,18 +751,26 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         # if grad_norm is not finite, skip the update
         if not torch.isfinite(grad_norm):
             logger.warning("grad_norm is not finite: %s; skipping this optimizer step.", grad_norm)
-            self.optimizer.zero_grad()
+            optimizer.zero_grad()
         else:
-            self.optimizer.step()
+            optimizer.step()
         return grad_norm.item()
 
     def lr_scheduler_step(self):
         """
         Advance FSDP scheduler and return updated learning rate.
         """
-        self.lr_scheduler.step()
-        lr = self.lr_scheduler.get_last_lr()[0]  # only return the first group
-        return lr
+        return self._step_lr_scheduler(self.lr_scheduler)
+
+    @staticmethod
+    def _step_lr_scheduler(lr_scheduler) -> float:
+        """Advance ``lr_scheduler`` and return the learning rate of its first parameter group."""
+        lr_scheduler.step()
+        return float(lr_scheduler.get_last_lr()[0])
+
+    def _optimizers(self) -> list[torch.optim.Optimizer]:
+        """Every optimizer whose state ``to`` moves with the model."""
+        return [] if self.optimizer is None else [self.optimizer]
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
         """
@@ -771,13 +789,15 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         if device == device_name:
             if model:
                 load_fsdp_model_to_gpu(self.module)
-            if optimizer and self.optimizer is not None:
-                load_fsdp_optimizer(self.optimizer, device)
+            if optimizer:
+                for engine_optimizer in self._optimizers():
+                    load_fsdp_optimizer(engine_optimizer, device)
         elif device == "cpu":
             if model:
                 offload_fsdp_model_to_cpu(self.module)
-            if optimizer and self.optimizer is not None:
-                offload_fsdp_optimizer(self.optimizer)
+            if optimizer:
+                for engine_optimizer in self._optimizers():
+                    offload_fsdp_optimizer(engine_optimizer)
         else:
             raise ValueError(f"Invalid device type: {device}")
 
