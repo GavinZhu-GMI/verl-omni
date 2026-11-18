@@ -30,6 +30,7 @@ from verl.trainer.ppo.core_algos import get_policy_loss_fn
 from verl.utils import tensordict_utils as tu
 
 from verl_omni.workers.config import DiffusionActorConfig
+from verl_omni.workers.config.diffusion.dmd import DiffusionDMDConfig
 
 
 @dataclass
@@ -2144,14 +2145,30 @@ class DMDLoss(DiffusionLossFn):
         generated_x0: torch.Tensor,
         fake_x0: torch.Tensor,
         teacher_x0: torch.Tensor,
-        normalization_epsilon: float = 1e-6,
+        dmd_config: DiffusionDMDConfig,
         gradient_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Compute the fp32 distribution-matching surrogate, not paired regression."""
+        """Compute the fp32 distribution-matching surrogate, not paired regression.
+
+        ``dmd_config.projected`` selects PDMD (arXiv 2609.35768, Eq. 4).
+        """
         from verl_omni.trainer.diffusion.distillation.utils import dmd_gradient, dmd_surrogate_loss
 
-        gradient, normalizer, nonfinite = dmd_gradient(fake_x0, teacher_x0, generated_x0, normalization_epsilon)
-        loss, active = dmd_surrogate_loss(generated_x0, gradient, gradient_mask)
+        gradient, normalizer, nonfinite = dmd_gradient(
+            fake_x0,
+            teacher_x0,
+            generated_x0,
+            dmd_config.normalization_epsilon,
+            projected=dmd_config.projected,
+            projection_epsilon=dmd_config.projection_epsilon,
+        )
+        loss, active = dmd_surrogate_loss(
+            generated_x0,
+            gradient,
+            gradient_mask,
+            scale=dmd_config.surrogate_scale,
+            clamp_max=dmd_config.loss_clamp,
+        )
         return loss, {
             "dmd/loss": loss.detach(),
             "dmd/normalizer": normalizer.mean(),
@@ -2160,15 +2177,25 @@ class DMDLoss(DiffusionLossFn):
             "dmd/active_elements": active,
         }
 
+    @staticmethod
+    def _stage_and_config(data: TensorDict) -> tuple[str, DiffusionDMDConfig]:
+        # Both are required: a silent default would train one role with the other's loss,
+        # or run DMD where PDMD was configured.
+        stage = tu.get_non_tensor_data(data, "dmd_stage", default=None)
+        dmd_config = tu.get_non_tensor_data(data, "dmd_config", default=None)
+        if stage not in ("student", "fake_score"):
+            raise ValueError(f"Invalid dmd_stage {stage!r}; expected 'student' or 'fake_score'.")
+        if not isinstance(dmd_config, DiffusionDMDConfig):
+            raise ValueError(f"dmd_config must be a DiffusionDMDConfig, got {type(dmd_config).__name__}.")
+        return stage, dmd_config
+
     def validate_inputs(self, *, loss_name: str, model_output: dict[str, Any], data: TensorDict) -> None:
         """Validate the stage-specific tensors without requiring PPO inputs."""
-        stage = tu.get_non_tensor_data(data, "dmd_stage", default="student")
+        stage, _ = self._stage_and_config(data)
         if stage == "student":
             required = ("generated_x0", "fake_x0", "teacher_x0")
-        elif stage == "fake_score":
-            required = ("generated_x0", "noise_pred", "noise")
         else:
-            raise ValueError(f"Invalid dmd_stage {stage!r}; expected 'student' or 'fake_score'.")
+            required = ("generated_x0", "noise_pred", "noise")
         missing = [key for key in required if key not in model_output]
         if missing:
             raise KeyError(f"Diffusion loss `{loss_name}` is missing model_output keys: {missing}")
@@ -2176,14 +2203,14 @@ class DMDLoss(DiffusionLossFn):
     def __call__(self, *, config: DiffusionActorConfig, model_output: dict[str, Any], data: TensorDict):
         """Dispatch DMD2 loss with an engine-provided mask, falling back to the batch mask."""
         self.validate_inputs(loss_name="dmd2", model_output=model_output, data=data)
-        stage = tu.get_non_tensor_data(data, "dmd_stage", default="student")
+        stage, dmd_config = self._stage_and_config(data)
         gradient_mask = model_output.get("gradient_mask", data.get("gradient_mask"))
         if stage == "student":
             loss, metrics = self.compute_loss(
                 generated_x0=model_output["generated_x0"],
                 fake_x0=model_output["fake_x0"],
                 teacher_x0=model_output["teacher_x0"],
-                normalization_epsilon=tu.get_non_tensor_data(data, "dmd_normalization_epsilon", default=1e-6),
+                dmd_config=dmd_config,
                 gradient_mask=gradient_mask,
             )
         else:
@@ -2194,6 +2221,7 @@ class DMDLoss(DiffusionLossFn):
                 model_output["noise"],
                 model_output["generated_x0"],
                 gradient_mask=gradient_mask,
+                clamp_max=dmd_config.loss_clamp,
             )
             metrics = {"fake_score/loss": loss.detach(), "fake_score/active_elements": active}
         return DiffusionLossResult(loss=loss, metrics=metrics, add_loss_metric=True)

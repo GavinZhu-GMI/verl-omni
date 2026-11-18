@@ -15,6 +15,7 @@
 import math
 from dataclasses import dataclass, field
 from functools import partial
+from typing import Optional
 
 from verl.base_config import BaseConfig
 from verl.workers.config.optimizer import FSDPOptimizerConfig
@@ -49,6 +50,14 @@ class DiffusionDMDConfig(BaseConfig):
     negative_prompt: str = " "
     # Per-sample score-difference normalization floor.
     normalization_epsilon: float = 1e-6
+    # PDMD (arXiv 2609.35768): remove the update component along the student-critic residual.
+    projected: bool = False
+    # Denominator floor of the PDMD projection.
+    projection_epsilon: float = 1e-8
+    # Factor on the student surrogate MSE; PDMD uses 1.0.
+    surrogate_scale: float = 0.5
+    # Per-sample clamp on the student and fake-score losses; None disables it, PDMD uses 5.0.
+    loss_clamp: Optional[float] = None
     # Fixed rational shift applied once to the inference sigma grid.
     rollout_timestep_shift: float = 3.0
     # Discrete score grid size; zero selects continuous score sampling.
@@ -116,6 +125,19 @@ class DiffusionDMDConfig(BaseConfig):
             raise ValueError("negative_prompt must be an explicit string for teacher conditioning")
         if self.normalization_epsilon <= 0:
             raise ValueError("normalization_epsilon must be positive")
+        if not isinstance(self.projected, bool):
+            raise ValueError(f"projected must be a bool, got {self.projected!r}")
+        for name in ("projection_epsilon", "surrogate_scale"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive, got {value!r}")
+        if self.loss_clamp is not None and (
+            isinstance(self.loss_clamp, bool)
+            or not isinstance(self.loss_clamp, int | float)
+            or not math.isfinite(self.loss_clamp)
+            or self.loss_clamp <= 0
+        ):
+            raise ValueError(f"loss_clamp must be None or finite and positive, got {self.loss_clamp!r}")
         if self.rollout_timestep_shift < 1 or self.score_timestep_shift < 1:
             raise ValueError("rollout_timestep_shift and score_timestep_shift must be at least 1")
         for prefix in ("score_sigma", "score_time"):

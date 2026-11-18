@@ -23,6 +23,7 @@ from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 
 from verl_omni.pipelines.dmd2.program import DMD2Program, backward_simulation, re_noise, shifted_sigmas
+from verl_omni.trainer.diffusion.distillation.utils import dmd_gradient, dmd_surrogate_loss
 from verl_omni.workers.config.diffusion.actor import DiffusionActorConfig, DiffusionLossConfig
 from verl_omni.workers.config.diffusion.dmd import DiffusionDMDConfig
 from verl_omni.workers.utils.losses import diffusion_loss
@@ -117,6 +118,27 @@ def test_loss_gradient_and_update_match_independent_formula(stage, modalities, a
             torch.testing.assert_close(value, expected_models[role].state_dict()[key], rtol=0, atol=0)
             if role != stage:
                 torch.testing.assert_close(value, before[role][key], rtol=0, atol=0)
+
+
+def test_pdmd_settings_reach_the_registered_loss():
+    """The program hands the loss its own config, so a PDMD run cannot silently compute plain DMD."""
+    settings = {"projected": True, "surrogate_scale": 1.0, "loss_clamp": 5.0}
+    actual, _, initial, _ = make_program(("image", "audio"), **settings)
+    reference, _, _, _ = make_program(("image", "audio"), **settings)
+    data, loss_function = loss_inputs()
+    torch.manual_seed(107)
+    actual_loss, _, _ = actual.compute_loss(initial, "student", data, loss_function)
+    torch.manual_seed(107)
+    outputs = reference.stage_outputs(initial, "student")
+    expected_loss = 0
+    for name, output in outputs.items():
+        gradient, _, _ = dmd_gradient(
+            output["fake_x0"], output["teacher_x0"], output["generated_x0"].detach(), 1e-6, projected=True
+        )
+        part, _ = dmd_surrogate_loss(output["generated_x0"], gradient, scale=1.0, clamp_max=5.0)
+        expected_loss = expected_loss + reference.config.modality_weights[name] * part
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=0, atol=0)
+    assert tu.get_non_tensor_data(data, "dmd_config", default=None) is actual.config
 
 
 @pytest.mark.parametrize("exit_step", range(4))

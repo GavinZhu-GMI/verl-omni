@@ -51,6 +51,18 @@ negative_prompt: ' '
 # Per-sample score normalization floor.
 normalization_epsilon: 1.0e-6
 
+# PDMD: remove the update component along the student-critic residual.
+projected: false
+
+# Denominator floor of the PDMD projection.
+projection_epsilon: 1.0e-8
+
+# Factor on the student surrogate MSE; PDMD uses 1.0.
+surrogate_scale: 0.5
+
+# Per-sample clamp on the student and fake-score losses; null disables it, PDMD uses 5.0.
+loss_clamp: null
+
 # Fixed inference sigma shift.
 rollout_timestep_shift: 3.0
 

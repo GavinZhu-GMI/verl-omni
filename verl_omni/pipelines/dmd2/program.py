@@ -231,7 +231,7 @@ class DMD2Program:
             value = tu.get_non_tensor_data(data, name, default=None)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"Caller must supply a positive integer {name} for the public loss wrapper")
-        tu.assign_non_tensor(data, dmd_stage=stage, dmd_normalization_epsilon=self.config.normalization_epsilon)
+        tu.assign_non_tensor(data, dmd_stage=stage, dmd_config=self.config)
         outputs = self.stage_outputs(initial, stage)
         loss, metrics, invalid = 0, {}, False
         for modality, output in outputs.items():

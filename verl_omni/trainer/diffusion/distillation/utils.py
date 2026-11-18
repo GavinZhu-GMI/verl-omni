@@ -27,6 +27,7 @@ from torch import Tensor
 
 __all__ = [
     "velocity_to_x0",
+    "project_orthogonal",
     "dmd_gradient",
     "dmd_surrogate_loss",
     "fake_score_target",
@@ -42,17 +43,37 @@ def velocity_to_x0(noisy: Tensor, velocity: Tensor, sigma: Tensor) -> Tensor:
     return noisy.float() - sigma.float() * velocity.float()
 
 
+def project_orthogonal(direction: Tensor, residual: Tensor, epsilon: float = 1e-8) -> Tensor:
+    """Remove the component of ``direction`` parallel to ``residual``, per sample, in fp32.
+
+    ``d - <d, r> / (<r, r> + epsilon) * r`` with inner products over every non-batch
+    dimension of ``(B, ...)`` tensors. A zero residual leaves the direction unchanged.
+    """
+    if direction.shape != residual.shape or direction.ndim < 2:
+        raise ValueError("Projection needs equal (B, ...) shapes with at least one non-batch dimension.")
+    direction, residual = direction.float(), residual.detach().float()
+    dims = tuple(range(1, direction.ndim))
+    parallel = (direction * residual).sum(dims, keepdim=True) / (residual.square().sum(dims, keepdim=True) + epsilon)
+    return direction - parallel * residual
+
+
 @torch.no_grad()
 def dmd_gradient(
     x0_fake: Tensor,
     x0_real: Tensor,
     x_g: Tensor,
     normalization_epsilon: float = 1e-6,
+    *,
+    projected: bool = False,
+    projection_epsilon: float = 1e-8,
 ) -> tuple[Tensor, Tensor, int]:
     """Return detached normalized fake-minus-real scores for tensors ``(B, ...)``.
 
     Return the gradient, per-sample clamped normalizer and replacement count.
     The normalizer is unmasked, including when the caller masks the final loss.
+    ``projected=True`` is PDMD (arXiv 2609.35768, Eq. 4): the direction loses its
+    component along the student-critic residual ``x_g - x0_fake`` before the same
+    normalizer is applied. Nonfinite entries become zero and are counted.
     """
     if not math.isfinite(normalization_epsilon) or normalization_epsilon <= 0:
         raise ValueError(f"normalization_epsilon must be finite and greater than zero, got {normalization_epsilon}.")
@@ -63,9 +84,13 @@ def dmd_gradient(
     x_g, x0_fake, x0_real = x_g.float(), x0_fake.float(), x0_real.float()
     normalizer = (x_g - x0_real).abs().mean(dim=tuple(range(1, x_g.ndim)), keepdim=True)
     normalizer = normalizer.clamp_min(normalization_epsilon)
-    gradient = (x0_fake - x0_real) / normalizer
+    direction = x0_fake - x0_real
+    if projected:
+        direction = project_orthogonal(direction, x_g - x0_fake, projection_epsilon)
+    gradient = direction / normalizer
     nonfinite = int((~torch.isfinite(gradient)).sum().item())
-    return torch.nan_to_num(gradient), normalizer, nonfinite
+    # saturating inf to the dtype max would turn one bad element into a 1e38 target
+    return torch.nan_to_num(gradient, nan=0.0, posinf=0.0, neginf=0.0), normalizer, nonfinite
 
 
 def expand_loss_mask(mask: Tensor, prediction: Tensor) -> Tensor:
@@ -80,23 +105,51 @@ def expand_loss_mask(mask: Tensor, prediction: Tensor) -> Tensor:
         raise ValueError(f"Loss mask shape {shape} is not broadcastable to {tuple(prediction.shape)}.") from exc
 
 
+def _clamped_sample_mean(squared: Tensor, mask: Optional[Tensor], clamp_max: float) -> tuple[Tensor, int]:
+    """Mean over samples of each sample's (masked) mean, each clamped at ``clamp_max``.
+
+    A clamped sample contributes no gradient, as in the PDMD reference run.
+    """
+    if mask is None:
+        per_sample = squared.flatten(1).mean(1)
+        return per_sample.clamp(max=clamp_max).mean(), squared.numel()
+    mask = expand_loss_mask(mask, squared)
+    counts = mask.flatten(1).sum(1)
+    active = int(counts.sum().item())
+    if active == 0:
+        raise ValueError("all-masked DMD loss is an error, not zero.")
+    present = counts > 0
+    per_sample = (squared * mask).flatten(1).sum(1)[present] / counts[present]
+    return per_sample.clamp(max=clamp_max).mean(), active
+
+
 def dmd_surrogate_loss(
     x_g: Tensor,
     g_normalized: Tensor,
     gradient_mask: Optional[Tensor] = None,
+    *,
+    scale: float = 0.5,
+    clamp_max: Optional[float] = None,
 ) -> tuple[Tensor, int]:
-    """Compute ``0.5 * mean((x_g - stop_gradient(x_g - g))**2)`` in fp32."""
+    """Compute ``scale * mean((x_g - stop_gradient(x_g - g))**2)`` in fp32.
+
+    ``clamp_max`` clamps each sample's loss, so a sample with a pathologically large
+    update stops contributing gradient. PDMD uses ``scale=1.0, clamp_max=5.0``.
+    """
     if x_g.shape != g_normalized.shape or x_g.numel() == 0:
         raise ValueError("Student and normalized gradient must have identical nonempty shapes.")
     x_g = x_g.float()
     target = (x_g - g_normalized.float()).detach()
+    squared = scale * (x_g - target).square()
+    if clamp_max is not None:
+        return _clamped_sample_mean(squared, gradient_mask, clamp_max)
     if gradient_mask is None:
-        return 0.5 * (x_g - target).square().mean(), x_g.numel()
+        return squared.mean(), x_g.numel()
     mask = expand_loss_mask(gradient_mask, x_g)
     active = int(mask.sum().item())
     if active == 0:
         raise ValueError("all-masked DMD loss is an error, not zero.")
-    return 0.5 * (x_g - target).square()[mask].sum() / active, active
+    return squared[mask].sum() / active, active
 
 
 def fake_score_target(noise: Tensor, x_g: Tensor) -> Tensor:
@@ -111,12 +164,19 @@ def fake_score_loss(
     noise: Tensor,
     x_g: Tensor,
     gradient_mask: Optional[Tensor] = None,
+    *,
+    clamp_max: Optional[float] = None,
 ) -> tuple[Tensor, int]:
-    """Compute fp32 denoising MSE; the engine must also detach its noisy inputs."""
+    """Compute fp32 denoising MSE; the engine must also detach its noisy inputs.
+
+    ``clamp_max`` clamps each sample's loss, as ``dmd_surrogate_loss`` does.
+    """
     target = fake_score_target(noise, x_g)
     if model_output.shape != target.shape or model_output.numel() == 0:
         raise ValueError("Fake-score prediction and target must have identical nonempty shapes.")
     difference = (model_output.float() - target).square()
+    if clamp_max is not None:
+        return _clamped_sample_mean(difference, gradient_mask, clamp_max)
     if gradient_mask is None:
         return difference.mean(), difference.numel()
     mask = expand_loss_mask(gradient_mask, model_output)

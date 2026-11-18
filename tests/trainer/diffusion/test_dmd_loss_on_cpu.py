@@ -27,9 +27,10 @@ def make_actor():
     return DiffusionActorConfig(strategy="fsdp2", rollout_n=1, diffusion_loss=DiffusionLossConfig(loss_mode="dmd2"))
 
 
-def make_batch(size, stage="student", accumulation=1, sp_size=1):
+def make_batch(size, stage="student", accumulation=1, sp_size=1, dmd_config=None):
     batch = TensorDict({}, batch_size=[size])
     tu.assign_non_tensor_data(batch, "dmd_stage", stage)
+    tu.assign_non_tensor_data(batch, "dmd_config", dmd_config or DiffusionDMDConfig())
     tu.assign_non_tensor_data(batch, "gradient_accumulation_steps", accumulation)
     tu.assign_non_tensor_data(batch, "sp_size", sp_size)
     return batch
@@ -148,7 +149,9 @@ class TestDMDLoss:
         torch.testing.assert_close(normalizer, torch.full((1, 1), epsilon))
         torch.testing.assert_close(gradient, torch.ones_like(generated))
         direct_loss, _ = dmd_surrogate_loss(generated, gradient)
-        computed_loss, _ = DMDLoss.compute_loss(generated_x0=generated, fake_x0=fake, teacher_x0=teacher)
+        computed_loss, _ = DMDLoss.compute_loss(
+            generated_x0=generated, fake_x0=fake, teacher_x0=teacher, dmd_config=DiffusionDMDConfig()
+        )
         dispatched_loss, _ = diffusion_loss(
             make_actor(), {"generated_x0": generated, "fake_x0": fake, "teacher_x0": teacher}, make_batch(1)
         )
@@ -168,8 +171,7 @@ class TestDMDLoss:
             diffusion_loss(make_actor(), {}, make_batch(1, "discriminator"))
 
     def test_normalization_setting_reaches_registered_loss(self):
-        batch = make_batch(1)
-        tu.assign_non_tensor_data(batch, "dmd_normalization_epsilon", 0.5)
+        batch = make_batch(1, dmd_config=DiffusionDMDConfig(normalization_epsilon=0.5))
         output = {"generated_x0": torch.zeros(1, 2), "teacher_x0": torch.zeros(1, 2), "fake_x0": torch.ones(1, 2)}
         loss, _ = diffusion_loss(make_actor(), output, batch)
         torch.testing.assert_close(loss, torch.tensor(2.0))
