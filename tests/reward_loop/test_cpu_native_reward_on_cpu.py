@@ -209,6 +209,13 @@ def test_explicit_native_device_matches_reserved_resource(monkeypatch, resource,
     from verl_omni.workers.config import reward as config_module
 
     monkeypatch.setattr(config_module, "get_device_name", lambda: "cuda")
+
+    def forbid_cuda():
+        raise AssertionError("reward config validation initialized CUDA")
+
+    # Guard the validation itself: on a GPU host an earlier import (diffusers importing flashinfer) may already
+    # have initialized CUDA, which a torch.cuda.is_initialized() check afterwards cannot tell apart.
+    monkeypatch.setattr(torch.cuda, "_lazy_init", forbid_cuda)
     value = {
         "backend": "native",
         "placement": {"resource": resource, **({"num_replicas": 2} if resource == "cpu" else {"devices": [0]})},
@@ -225,7 +232,6 @@ def test_explicit_native_device_matches_reserved_resource(monkeypatch, resource,
                     flags={"allow_objects": True},
                 )
             )
-    assert not torch.cuda.is_initialized()
 
 
 @pytest.mark.asyncio
