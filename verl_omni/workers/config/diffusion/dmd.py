@@ -201,3 +201,7 @@ class DiffusionDMDConfig(BaseConfig):
         valid_export_roles = {"student", "student_ema"}
         if self.export_role not in valid_export_roles:
             raise ValueError(f"Invalid export_role: {self.export_role}. Must be one of {sorted(valid_export_roles)}")
+
+    def training_stages(self) -> tuple[str, ...]:
+        """Return the stages of one schedule period: ``fake_update_ratio`` fake-score updates, then one student."""
+        return ("fake_score",) * self.fake_update_ratio + ("student",)

@@ -18,6 +18,7 @@ Checked on the H3 LoRA targets, sharded per block as the engine shards:
   isolation  a stage's backward and step change only its adapter
   recompute  with activation checkpointing, a stage's gradients equal those without it, although the stage runs
              forwards under the other adapter and under the teacher between its forward and its backward
+  nonfinite  a NaN gradient on rank 1 only gives every rank the same nonfinite norm, and no rank steps
 """
 
 import argparse
@@ -170,8 +171,44 @@ def _check_isolation(engine, inputs) -> dict[str, dict]:
     return result
 
 
+def _poison_one_gradient(module, trained: str) -> str:
+    """Set one element of a local gradient shard of ``trained`` to NaN, and return the parameter's name."""
+    names = {id(param): name for name, param in module.named_parameters()}
+    for param in adapter_parameters(module, trained):
+        assert param.grad is not None, f"adapter {trained!r} parameter {names[id(param)]} has no gradient"
+        local = param.grad.to_local()
+        if local.numel() > 0:
+            local.view(-1)[0] = float("nan")
+            return names[id(param)]
+    raise AssertionError(f"rank {dist.get_rank()} holds no gradient element of adapter {trained!r}")
+
+
+def _check_nonfinite(engine, inputs) -> dict[str, dict]:
+    result = {}
+    for trained in ADAPTERS:
+        before = {name: _full(param) for name, param in engine.module.named_parameters()}
+        with engine.train_stage(trained):
+            engine.optimizer_zero_grad()
+            _loss(_outputs(engine.module, inputs)).backward()
+            poisoned = _poison_one_gradient(engine.module, trained) if dist.get_rank() == 1 else None
+            grad_norm = engine.optimizer_step()
+            engine.optimizer_zero_grad()
+        grad_norms: list[float | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(grad_norms, grad_norm)
+        poisoned_names: list[str | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(poisoned_names, poisoned)
+        result[trained] = {
+            "grad_norms": [str(value) for value in grad_norms],
+            "poisoned": poisoned_names,
+            "changed": sum(
+                not torch.equal(_full(param), before[name]) for name, param in engine.module.named_parameters()
+            ),
+        }
+    return result
+
+
 def main() -> None:
-    """Run the three checks in one process group and write rank 0's evidence."""
+    """Run the four checks in one process group and write rank 0's evidence."""
     parser = argparse.ArgumentParser()
     parser.add_argument("evidence", type=Path)
     args = parser.parse_args()
@@ -186,6 +223,7 @@ def main() -> None:
         _randomize_lora_b(model)
         evidence["recompute"] = _check_recompute(engine, inputs)
         evidence["isolation"] = _check_isolation(engine, inputs)
+        evidence["nonfinite"] = _check_nonfinite(engine, inputs)
         evidence["active_after"] = engine.module.active_adapters()
         if dist.get_rank() == 0:
             args.evidence.write_text(json.dumps(evidence, indent=2, sort_keys=True))

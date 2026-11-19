@@ -592,8 +592,3 @@ def test_prediction_layout_cannot_silently_broadcast(prediction):
     program.predict = lambda *args: prediction
     with pytest.raises(ValueError, match="Velocity predictions"):
         program.rollout(initial)
-
-
-def test_training_stages_put_fake_score_updates_first():
-    program, _, _, _ = make_program(fake_update_ratio=5)
-    assert program.training_stages() == ("fake_score",) * 5 + ("student",)

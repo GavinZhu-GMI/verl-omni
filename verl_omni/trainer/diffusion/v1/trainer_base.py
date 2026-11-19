@@ -142,7 +142,7 @@ DIFFUSION_TRAINER_REGISTRY: dict[str, type] = {}
 
 
 def register_diffusion_trainer(name: str):
-    """Class decorator that registers a PolicyGradientDiffusionTrainerV1 subclass."""
+    """Class decorator that registers a v1 diffusion trainer class under ``name``."""
 
     def decorator(cls):
         DIFFUSION_TRAINER_REGISTRY[name] = cls

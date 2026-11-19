@@ -82,6 +82,15 @@ def test_stage_updates_only_its_adapter(evidence, role):
     assert result["grad_norm"] > 0
 
 
+@pytest.mark.parametrize("role", ADAPTERS)
+def test_nonfinite_gradient_on_one_rank_skips_the_step_on_every_rank(evidence, role):
+    """Every rank sees the same nonfinite norm, so the driver can abort without leaving a rank in a collective."""
+    result = evidence["nonfinite"][role]
+    assert result["poisoned"][0] is None and result["poisoned"][1] is not None
+    assert result["grad_norms"] == ["nan", "nan"]
+    assert result["changed"] == 0
+
+
 def test_default_is_active_after_the_stages(evidence):
     """Stages and restoring contexts leave the student adapter active."""
     assert evidence["active_after"] == ["default"]

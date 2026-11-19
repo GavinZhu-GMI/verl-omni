@@ -123,10 +123,6 @@ class DMD2Program:
         self.predict = predict
         self.control_rng = torch.Generator().manual_seed(seed)
 
-    def training_stages(self) -> tuple[str, ...]:
-        """Return the fake-first attempt schedule; this method performs no updates."""
-        return ("fake_score",) * self.config.fake_update_ratio + ("student",)
-
     def state_dict(self) -> dict[str, Tensor]:
         """Capture exit selection; the caller separately saves CPU and device RNGs."""
         return {"control_rng": self.control_rng.get_state()}

@@ -23,6 +23,7 @@ from verl_omni.trainer.diffusion.v1.trainer_base import (
     get_diffusion_trainer_cls,
     register_diffusion_trainer,
 )
+from verl_omni.trainer.diffusion.v1.trainer_distribution_matching import DistributionMatchingDiffusionTrainerV1
 from verl_omni.trainer.diffusion.v1.trainer_separate_async import (
     PolicyGradientDiffusionTrainerV1SeparateAsync,
 )
@@ -30,6 +31,7 @@ from verl_omni.trainer.diffusion.v1.trainer_sync import PolicyGradientDiffusionT
 
 __all__ = [
     "DIFFUSION_TRAINER_REGISTRY",
+    "DistributionMatchingDiffusionTrainerV1",
     "PolicyGradientDiffusionTrainerV1",
     "PolicyGradientDiffusionTrainerV1SeparateAsync",
     "PolicyGradientDiffusionTrainerV1Sync",

@@ -249,3 +249,6 @@ class TestDMDConfig:
     def test_out_of_scope_options_are_not_accepted(self, field):
         with pytest.raises(ConfigCompositionException):
             compose_config([f"dmd.{field}=unsupported"])
+
+    def test_training_stages_put_fake_score_updates_first(self):
+        assert DiffusionDMDConfig(fake_update_ratio=5).training_stages() == ("fake_score",) * 5 + ("student",)
