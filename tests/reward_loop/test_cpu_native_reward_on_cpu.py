@@ -14,6 +14,7 @@
 """CPU-native reward placement and executor contracts."""
 
 import asyncio
+import time
 from threading import Event
 from types import SimpleNamespace
 
@@ -46,9 +47,16 @@ def test_cpu_native_role_resolves_placement_interpolations():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("dispose", ["fast", "slow"])
 @pytest.mark.parametrize("kind", ["thread", "async", "awaitable"])
-async def test_cancelled_native_inference_keeps_model_until_actual_completion(monkeypatch, kind):
+async def test_cancelled_native_inference_keeps_model_until_actual_completion(monkeypatch, kind, dispose):
+    """A cancelled caller leaves the model loaded until its inference ends; then sleep() disposes of it.
+
+    ``slow``: the disposal's ``gc.collect()`` blocks the event loop for 1.2 s, longer than a 1 s wait.
+    """
     entered, release, finished, closed = (Event() for _ in range(4))
+    if dispose == "slow":
+        monkeypatch.setattr(executor_module.gc, "collect", lambda: time.sleep(1.2))
 
     async def async_infer(self, value):
         entered.set()
@@ -102,9 +110,10 @@ async def test_cancelled_native_inference_keeps_model_until_actual_completion(mo
         assert not sleeping.done()
         assert not closed.is_set()
         release.set()
-        await asyncio.wait_for(sleeping, 1)
+        hang_guard_s = 10  # only stops a hang; sleep()'s gc.collect() can block the loop for over 1 s
+        await asyncio.wait_for(sleeping, hang_guard_s)
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(asyncio.shield(caller), 1)
+            await asyncio.wait_for(asyncio.shield(caller), hang_guard_s)
         assert finished.is_set() and closed.is_set()
         assert executor._inflight == 0 and executor._model is None
     finally:
