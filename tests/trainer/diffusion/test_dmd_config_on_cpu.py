@@ -79,6 +79,24 @@ class TestDMDConfig:
         with pytest.raises(ValueError, match="positive integer"):
             DiffusionDMDConfig(**{field: value})
 
+    def test_stage_micro_batch_sizes_must_match(self):
+        """The student trains each microbatch on the fake_score rollout of the same slot."""
+        with pytest.raises(ValueError, match="must equal"):
+            DiffusionDMDConfig(fake_score_micro_batch_size_per_gpu=1, student_micro_batch_size_per_gpu=2)
+
+    @pytest.mark.parametrize(
+        "schedule",
+        [{"lr_warmup_steps": 2}, {"lr_warmup_steps_ratio": 0.1}, {"lr_scheduler_type": "cosine"}],
+        ids=["warmup", "warmup_ratio", "cosine"],
+    )
+    def test_a_fake_score_learning_rate_schedule_is_rejected(self, schedule):
+        """DMD trains at a constant LR; the fake_score scheduler would step fake_update_ratio times per step."""
+        with pytest.raises(ValueError, match="constant learning rate"):
+            DiffusionDMDConfig(fake_score_optim=FSDPOptimizerConfig(lr=2e-5, **schedule))
+
+    def test_a_constant_fake_score_learning_rate_is_accepted(self):
+        DiffusionDMDConfig(fake_score_optim=FSDPOptimizerConfig(lr=2e-5, lr_warmup_steps=0))
+
     @pytest.mark.parametrize("field", ["score_discrete_steps", "ema_start_step"])
     @pytest.mark.parametrize("value", [True, -1, 0.5])
     def test_nonnegative_counts_are_validated(self, field, value):

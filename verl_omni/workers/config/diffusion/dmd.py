@@ -23,6 +23,25 @@ from verl.workers.config.optimizer import FSDPOptimizerConfig
 __all__ = ["DiffusionDMDConfig"]
 
 
+def check_constant_learning_rate(role: str, optim: FSDPOptimizerConfig) -> None:
+    """Reject an LR schedule for ``role``: DMD trains at a constant learning rate, as the reference implementation
+    does (https://github.com/ZeamoxWang/pdmd, ``training/train.py``).
+
+    Each adapter's scheduler steps once per optimizer update, so the fake_score scheduler steps
+    ``fake_update_ratio`` times per training step: a schedule would run that many times faster for the fake score
+    than for the student. Supporting one needs the fake-score schedule scaled to the training steps, with a test.
+
+    Raises:
+        ValueError: ``optim`` warms up or decays the learning rate.
+    """
+    warmup = optim.lr_warmup_steps is not None and optim.lr_warmup_steps > 0
+    if optim.lr_scheduler_type != "constant" or warmup or optim.lr_warmup_steps_ratio:
+        raise ValueError(
+            f"The {role} optimizer needs a constant learning rate without warmup; "
+            "DMD trains at a constant learning rate, as pdmd does"
+        )
+
+
 @dataclass
 class DiffusionDMDConfig(BaseConfig):
     """DMD2 distribution-only settings, independent of on-policy distillation."""
@@ -36,7 +55,7 @@ class DiffusionDMDConfig(BaseConfig):
     fake_update_ratio: int = 2
     # Student physical microbatch size per data-parallel rank.
     student_micro_batch_size_per_gpu: int = 1
-    # Fake-score physical microbatch size per data-parallel rank.
+    # Fake-score physical microbatch size per data-parallel rank; equals student_micro_batch_size_per_gpu.
     fake_score_micro_batch_size_per_gpu: int = 1
     # Fake score uses the existing optimizer type, independently of the actor.
     fake_score_optim: FSDPOptimizerConfig = field(
@@ -119,6 +138,12 @@ class DiffusionDMDConfig(BaseConfig):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        if self.fake_score_micro_batch_size_per_gpu != self.student_micro_batch_size_per_gpu:
+            raise ValueError(
+                "fake_score_micro_batch_size_per_gpu must equal student_micro_batch_size_per_gpu: the student trains "
+                "each microbatch on the fake_score rollout of the same slot"
+            )
+        check_constant_learning_rate("fake_score", self.fake_score_optim)
         for name in ("score_discrete_steps", "ema_start_step"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:

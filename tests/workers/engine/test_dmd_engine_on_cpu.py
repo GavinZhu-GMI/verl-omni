@@ -15,31 +15,13 @@
 
 import pytest
 import torch
-from diffusers import ConfigMixin, ModelMixin
-from diffusers.configuration_utils import register_to_config
-from diffusers.loaders.peft import PeftAdapterMixin
-from dmd_engine_fixtures import CRITIC_LR, STUDENT_LR, make_dmd_engine, optimizer_config
+from dmd_engine_fixtures import CRITIC_LR, STUDENT_LR, TinyDiT, make_dmd_engine
 from peft import LoraConfig
 
 from verl_omni.utils.config import resolve_lora_config
 from verl_omni.workers.engine.fsdp import diffusers_impl
 from verl_omni.workers.engine.fsdp.dmd_impl import DMDDiffusersFSDPEngine
 from verl_omni.workers.engine.lora_adapter_mixin import adapter_parameters
-
-
-class TinyDiT(ModelMixin, ConfigMixin, PeftAdapterMixin):
-    """Two linear layers with the diffusers PEFT adapter API."""
-
-    @register_to_config
-    def __init__(self, dim: int = 8):
-        """Build the input and output projections."""
-        super().__init__()
-        self.proj_in = torch.nn.Linear(dim, dim)
-        self.proj_out = torch.nn.Linear(dim, dim)
-
-    def forward(self, hidden_states):
-        """Return the projected hidden states."""
-        return self.proj_out(torch.tanh(self.proj_in(hidden_states)))
 
 
 def make_engine() -> DMDDiffusersFSDPEngine:
@@ -82,8 +64,7 @@ def test_each_optimizer_holds_only_its_adapter_with_its_own_lr():
     """The student optimizer gets the default adapter at the actor LR; the critic gets fake_score at its LR."""
     engine = make_engine()
     for adapter, lr in (("default", STUDENT_LR), ("fake_score", CRITIC_LR)):
-        with engine.train_stage(adapter):
-            optimizer = engine._stage_optimizer().optimizer
+        optimizer = engine._adapter_optimizers[adapter].optimizer
         held = [param for group in optimizer.param_groups for param in group["params"]]
         assert {id(param) for param in held} == {id(param) for param in adapter_parameters(engine.module, adapter)}
         assert [group["lr"] for group in optimizer.param_groups] == [lr] * len(optimizer.param_groups)
@@ -106,7 +87,6 @@ def test_stage_updates_only_its_adapter(trained, other):
         assert _active(engine) == [trained]
         output.square().mean().backward()
         grad_norm = engine.optimizer_step()
-        engine.lr_scheduler_step()
     assert grad_norm > 0
     trained_ids = {id(param) for param in adapter_parameters(engine.module, trained)}
     for name, param in engine.module.named_parameters():
@@ -157,15 +137,24 @@ def test_optimizer_calls_outside_a_stage_act_on_the_default_adapter():
         assert torch.equal(param, before[name]) is (id(param) not in student_ids), name
 
 
-def test_critic_stage_steps_the_critic_scheduler():
-    """lr_scheduler_step inside a stage advances that adapter's scheduler and returns its LR."""
+def test_lr_scheduler_step_reports_the_learning_rate_of_the_last_updated_adapter():
     engine = make_engine()
-    with engine.train_stage("fake_score"):
-        assert engine.lr_scheduler_step() == pytest.approx(CRITIC_LR)
+    for adapter, lr in (("fake_score", CRITIC_LR), ("default", STUDENT_LR), ("fake_score", CRITIC_LR)):
+        with engine.train_stage(adapter):
+            engine.optimizer_zero_grad()
+            engine.module(torch.randn(4, 8)).square().mean().backward()
+            engine.optimizer_step()
+        assert engine.lr_scheduler_step() == pytest.approx(lr)
+
+
+def test_lr_scheduler_step_before_any_update_raises():
+    """No adapter has stepped yet, so there is no LR to report."""
+    with pytest.raises(RuntimeError, match="no optimizer_step has run yet"):
+        make_engine().lr_scheduler_step()
 
 
 def test_stage_and_optimizer_misuse_raises():
-    """Nested stages, stages without an optimizer and duplicate or unknown optimizers are rejected."""
+    """Nested stages and stages without an optimizer are rejected."""
     engine = make_engine()
     with engine.train_stage("fake_score"):
         with pytest.raises(RuntimeError, match="already in the 'fake_score' stage"):
@@ -174,13 +163,14 @@ def test_stage_and_optimizer_misuse_raises():
     with pytest.raises(ValueError, match="no optimizer"):
         with engine.train_stage("old"):
             pass
-    with pytest.raises(ValueError, match="already has an optimizer"):
-        engine.add_adapter_optimizer("fake_score", optimizer_config(CRITIC_LR))
-    with pytest.raises(ValueError, match="already has an optimizer"):
-        engine.add_adapter_optimizer("default", optimizer_config(CRITIC_LR))
-    with pytest.raises(ValueError, match="no parameters"):
-        engine.add_adapter_optimizer("old", optimizer_config(CRITIC_LR))
     assert _active(engine) == ["default"]
+
+
+def test_an_engine_without_the_fake_score_adapter_fails_to_build():
+    module = TinyDiT()
+    module.add_adapter(LoraConfig(r=2, lora_alpha=2, target_modules=["proj_in", "proj_out"]), adapter_name="default")
+    with pytest.raises(ValueError, match="no parameters"):
+        make_dmd_engine(module)
 
 
 def test_to_moves_every_adapter_optimizer(monkeypatch):
@@ -194,8 +184,7 @@ def test_to_moves_every_adapter_optimizer(monkeypatch):
     monkeypatch.setattr(diffusers_impl, "get_device_name", lambda: "cuda")
     engine.to("cpu", model=False, optimizer=True, grad=False)
     engine.to("cuda", model=False, optimizer=True, grad=False)
-    with engine.train_stage("fake_score"):
-        critic = engine._stage_optimizer().optimizer
+    critic = engine._adapter_optimizers["fake_score"].optimizer
     assert moved == [
         ("cpu", engine.optimizer),
         ("cpu", critic),

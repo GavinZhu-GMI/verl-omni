@@ -63,7 +63,8 @@ class DistributionMatchingDiffusionTrainerV1:
     def init(self):
         """Build the worker group and the dataloader."""
         raise NotImplementedError(
-            f"{type(self).__name__} cannot build its worker group yet: the DMD engine has no batch forward path."
+            f"{type(self).__name__} cannot build its worker group yet: no training worker passes dmd_config to the "
+            "DMD engine."
         )
 
     def _prompt_batches(self) -> Iterator[TensorDict]:

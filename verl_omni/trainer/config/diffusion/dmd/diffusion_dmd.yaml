@@ -24,7 +24,7 @@ fake_update_ratio: 2
 # Student physical microbatch size per GPU.
 student_micro_batch_size_per_gpu: 1
 
-# Fake-score physical microbatch size per GPU.
+# Fake-score physical microbatch size per GPU; equals student_micro_batch_size_per_gpu.
 fake_score_micro_batch_size_per_gpu: 1
 
 # Independent fake-score optimizer, reusing the FSDP optimizer configuration.
