@@ -50,8 +50,7 @@ class TinyDiT(ModelMixin, ConfigMixin, PeftAdapterMixin):
         return self.proj_out(torch.tanh(self.proj_in(hidden_states)))
 
 
-@DiffusionModelBase.register(ARCHITECTURE, algorithm="dmd2")
-class RecordingDMDModel:
+class _RecordingDMDModel:
     """Stand-in for a ``(architecture, dmd2)`` adapter: one ``image`` modality of shape (B, 2, 3).
 
     Each prediction scales the latents by a scalar of the module output, so gradients reach the active adapter.
@@ -87,6 +86,13 @@ class RecordingDMDModel:
         }
 
 
+# The engine tests import this module as ``dmd_engine_fixtures``, the H3 adapter tests as
+# ``tests.workers.engine.dmd_engine_fixtures``: both copies must dispatch to the one class whose ``calls`` they read.
+RecordingDMDModel = DiffusionModelBase.peek_class(ARCHITECTURE, "dmd2") or DiffusionModelBase.register(
+    ARCHITECTURE, algorithm="dmd2"
+)(_RecordingDMDModel)
+
+
 def optimizer_config(lr: float, lr_warmup_steps: int = -1, **schedule) -> FSDPOptimizerConfig:
     """AdamW with beta1 = 0, beta2 = 0.9, no weight decay and gradient clipping at 1, at ``lr`` over 100 steps."""
     return FSDPOptimizerConfig(
@@ -117,12 +123,16 @@ def dmd_config(**overrides) -> DiffusionDMDConfig:
     return DiffusionDMDConfig(**{**settings, **overrides})
 
 
-def model_config() -> SimpleNamespace:
-    return SimpleNamespace(architecture=ARCHITECTURE, algorithm="dmd2", external_lib=None, lora_rank=2)
+def model_config(architecture: str = ARCHITECTURE) -> SimpleNamespace:
+    return SimpleNamespace(architecture=architecture, algorithm="dmd2", external_lib=None, lora_rank=2)
 
 
-def make_dmd_engine(module: torch.nn.Module, config: DiffusionDMDConfig | None = None) -> DMDDiffusersFSDPEngine:
+def make_dmd_engine(
+    module: torch.nn.Module, config: DiffusionDMDConfig | None = None, architecture: str = ARCHITECTURE
+) -> DMDDiffusersFSDPEngine:
     """Return an engine over ``module`` (adapters ``default`` and ``fake_score``) with both optimizers built.
+
+    ``architecture`` selects the ``(architecture, dmd2)`` adapter; the default is ``RecordingDMDModel``.
 
     The engine runs its own ``__init__`` and ``_build_model_optimizer``. Only the base engine's steps are replaced:
     its ``__init__`` would build a device mesh, and its model build would load the module from a model config;
@@ -148,7 +158,7 @@ def make_dmd_engine(module: torch.nn.Module, config: DiffusionDMDConfig | None =
         patch.object(DiffusersFSDPEngine, "_build_model_optimizer", base_build_model_optimizer),
     ):
         engine = DMDDiffusersFSDPEngine(
-            model_config(),
+            model_config(architecture),
             SimpleNamespace(strategy="fsdp2", forward_only=False, seed=3),
             optimizer_config(STUDENT_LR),
             None,

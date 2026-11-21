@@ -57,6 +57,9 @@ __all__ = [
     "split_dual_velocity",
     "h3_dit_timestep",
     "h3_velocity_to_flow_match",
+    "H3Layout",
+    "h3_sample_model_inputs",
+    "h3_target_velocities",
     "prepare_h3_processor_files",
     "ref2va_reference_image_short_edge",
     "validate_ref2va_reference_image_short_edge",
@@ -465,6 +468,10 @@ def _frame_position_grid(
     return torch.stack([grid.reshape(-1) for grid in grids], dim=-1), width_grid
 
 
+# position_ids, token_tags, video_indices, audio_indices, text_indices, condition video rows, condition audio rows
+H3Layout = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]
+
+
 def build_packed_sequence(
     text_token_tags: torch.Tensor,
     num_latent_frames: int,
@@ -476,7 +483,7 @@ def build_packed_sequence(
     audio_tag: int = AUDIO_TAG,
     video_tag: int = VIDEO_TAG,
     keyframe_anchors: tuple[str, ...] = (),
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+) -> H3Layout:
     """Build the packed H3 text, condition, audio, and video layout."""
     _, patch_h, patch_w = patch_size
     rows_per_frame = (latent_height // patch_h) * (latent_width // patch_w)
@@ -541,7 +548,7 @@ def build_layout_from_meta(
     patch_size: tuple[int, int, int] = (1, 2, 2),
     keyframe_anchors: tuple[str, ...] = (),
     text_token_tags: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+) -> H3Layout:
     """Build an H3 layout from target metadata and optional FL2VA anchors."""
     num_video_rows, num_audio_rows = int(meta[0]), int(meta[1])
     num_latent_frames, latent_height, latent_width = int(meta[2]), int(meta[3]), int(meta[4])
@@ -581,7 +588,7 @@ def build_ref2va_layout_from_meta(
     ref_block_meta: torch.Tensor,
     ref_block_count: int,
     text_token_tags: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+) -> H3Layout:
     """Build the Actor layout from compact Ref2VA reference metadata."""
     from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
 
@@ -643,6 +650,68 @@ def build_row_timesteps(
     row_timesteps[audio_indices[num_condition_audio_rows:]] = audio_timestep
     row_timesteps[audio_indices[:num_condition_audio_rows]] = condition_audio_timestep
     return torch.unique(row_timesteps, sorted=True, return_inverse=True)
+
+
+def h3_sample_model_inputs(
+    layout: H3Layout,
+    video_rows: torch.Tensor,
+    audio_rows: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    *,
+    video_timestep: float,
+    audio_timestep: float,
+    condition_video_timestep: float,
+    condition_audio_timestep: float,
+) -> dict[str, Any]:
+    """Build the H3 DiT call of one sample from its packed layout and per-row timesteps.
+
+    Args:
+        layout: The sample's packed layout, as ``build_layout_from_meta`` returns it.
+        video_rows: ``(1, condition + target rows, width)``, condition rows first; ``audio_rows`` likewise.
+        encoder_hidden_states: ``(1, text tokens, text_dim)``, cut to the sample's prompt length.
+        video_timestep: H3's data-fraction timestep t = 1 - sigma, as ``h3_dit_timestep`` returns it; so are
+            ``audio_timestep`` and the two condition-row timesteps.
+    """
+    position_ids, token_tags, video_indices, audio_indices, text_indices, num_cond_video, num_cond_audio = layout
+    device = video_rows.device
+    unique_timesteps, timestep_indices = build_row_timesteps(
+        video_indices,
+        audio_indices,
+        num_cond_video,
+        num_cond_audio,
+        encoder_hidden_states.shape[1],
+        video_timestep=video_timestep,
+        audio_timestep=audio_timestep,
+        condition_video_timestep=condition_video_timestep,
+        condition_audio_timestep=condition_audio_timestep,
+    )
+    return {
+        "hidden_states": video_rows,
+        "audio_hidden_states": audio_rows,
+        "encoder_hidden_states": encoder_hidden_states,
+        "timestep": unique_timesteps.to(device),
+        "timestep_indices": timestep_indices.to(device),
+        "token_tags": token_tags.to(device),
+        "position_ids": position_ids.to(device),
+        "video_indices": video_indices.to(device),
+        "audio_indices": audio_indices.to(device),
+        "text_indices": text_indices.to(device),
+        "return_dict": False,
+    }
+
+
+def h3_target_velocities(result, layout: H3Layout) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the flow-match velocities ``z - x0`` of a sample's target rows from its H3 DiT output.
+
+    Returns:
+        The target video rows' and audio rows' velocities, ``(1, target rows, width)`` each.
+    """
+    *_, num_cond_video, num_cond_audio = layout
+    video_velocity, audio_velocity = split_dual_velocity(result)
+    return (
+        h3_velocity_to_flow_match(video_velocity[:, num_cond_video:]),
+        h3_velocity_to_flow_match(audio_velocity[:, num_cond_audio:]),
+    )
 
 
 class _PromptTokenOverride:

@@ -22,14 +22,13 @@ from verl.utils import tensordict_utils as tu
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     build_layout_from_meta,
     build_ref2va_layout_from_meta,
-    build_row_timesteps,
     h3_dit_timestep,
+    h3_sample_model_inputs,
+    h3_target_velocities,
     h3_ulysses_forward,
-    h3_velocity_to_flow_match,
     keyframe_indices_to_anchors,
     pack_video_audio_rows,
     prepare_h3_processor_files,
-    split_dual_velocity,
     unpack_video_audio_rows,
     validate_lora_target_modules,
 )
@@ -143,7 +142,6 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
         timestep = model_inputs["timestep"]
         meta = model_inputs["latent_meta"]
         sp_size = model_inputs.get("_h3_sp_size", 1)
-        device = video_rows.device
         raw_patch = getattr(getattr(module, "config", None), "patch_size", (1, 2, 2))
         patch_size = (int(raw_patch[0]), int(raw_patch[1]), int(raw_patch[2]))
 
@@ -175,9 +173,7 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
                     int(ref_block_count[index].reshape(-1)[0]),
                     text_token_tags=sample_text_tags,
                 )
-            position_ids, token_tags, video_indices, audio_indices, text_indices, num_cond_video, num_cond_audio = (
-                layout
-            )
+            *_, num_cond_video, num_cond_audio = layout
             sample_video_condition = condition_video_rows[index]
             if condition_video_row_count is not None:
                 sample_video_condition = sample_video_condition[: int(condition_video_row_count[index].reshape(-1)[0])]
@@ -197,40 +193,18 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
             full_video_rows = torch.cat([sample_video_condition, video_rows[index]], dim=0).unsqueeze(0)
             full_audio_rows = torch.cat([sample_audio_condition, audio_rows[index]], dim=0).unsqueeze(0)
             video_t = float(timestep[index])
-            unique_timesteps, timestep_indices = build_row_timesteps(
-                video_indices,
-                audio_indices,
-                num_cond_video,
-                num_cond_audio,
-                num_text_tokens,
+            sample_inputs = h3_sample_model_inputs(
+                layout,
+                full_video_rows,
+                full_audio_rows,
+                encoder_hidden_states[index : index + 1, :num_text_tokens],
                 video_timestep=video_t,
                 audio_timestep=video_t,
                 condition_video_timestep=max(video_t, 0.999),
                 condition_audio_timestep=1.0 if ref_block_meta is not None else video_t,
             )
-            result = h3_ulysses_forward(
-                module,
-                {
-                    "hidden_states": full_video_rows,
-                    "audio_hidden_states": full_audio_rows,
-                    "encoder_hidden_states": encoder_hidden_states[index : index + 1, :num_text_tokens],
-                    "timestep": unique_timesteps.to(device),
-                    "timestep_indices": timestep_indices.to(device),
-                    "token_tags": token_tags.to(device),
-                    "position_ids": position_ids.to(device),
-                    "video_indices": video_indices.to(device),
-                    "audio_indices": audio_indices.to(device),
-                    "text_indices": text_indices.to(device),
-                    "return_dict": False,
-                },
-                sp_size,
-            )
-            v_video, v_audio = split_dual_velocity(result)
-            v_video = v_video[:, num_cond_video:]
-            v_audio = v_audio[:, num_cond_audio:]
-            packed_velocities.append(
-                pack_video_audio_rows(h3_velocity_to_flow_match(v_video), h3_velocity_to_flow_match(v_audio))
-            )
+            v_video, v_audio = h3_target_velocities(h3_ulysses_forward(module, sample_inputs, sp_size), layout)
+            packed_velocities.append(pack_video_audio_rows(v_video, v_audio))
         return torch.cat(packed_velocities, dim=0)
 
     @classmethod
