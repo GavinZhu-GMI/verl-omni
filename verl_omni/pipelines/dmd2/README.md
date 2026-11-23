@@ -57,12 +57,20 @@ keys: `+dmd.modality_shifts.image=3.0` and `+dmd.modality_weights.image=1.0`.
 
 Changing an unused field raises an error.
 
-`rollout(initial)` runs the student for every step without autograd and returns a
+Every random draw is keyed. `program.keys(update, samples)` returns the `DrawKeys` of one
+microbatch: row `b` is global sample `samples[b]` of 0-based `update`. Draw `name` of a row
+uses a generator seeded by `stream_seed(seed, name, update, sample)`; the names are
+`rollout_renoise`, `draws` (critic times and score ratios), `renoise` and `score_query`.
+The caller draws the initial latents the same way under `noise`
+(`keys.generators("noise", device)`). A draw thus depends on its update and sample only,
+not on the microbatch, the rank or any RNG state.
+
+`rollout(initial, keys=...)` runs the student for every step without autograd and returns a
 `Trajectory`: all `num_inference_steps + 1` FP32 states and each modality's grid, from
 fresh standard Gaussian `initial` latents. The grid shifts the knots in FP64, then casts
-to FP32. `sample(initial)` returns the rollout endpoint.
+to FP32. `sample(initial, keys=...)` returns the rollout endpoint.
 
-`stage_outputs(trajectory, stage, exit_index)` builds the loss inputs from a stored
+`stage_outputs(trajectory, stage, exit_index, keys=...)` builds the loss inputs from a stored
 rollout, so a student update can reuse the trajectory of the fake-score update before it.
 
 - `fake_score`: re-noise the endpoint `states[-1]` at per-sample critic sigmas with
@@ -73,11 +81,12 @@ rollout, so a student update can reuse the trajectory of the fake-score update b
 - `student`: re-run the student with autograd at `states[exit_index]` and take its x0.
   The query sigma is `grid[k + 1] + r * (grid[k] - grid[k + 1])` with one `r` per sample
   shared by all modalities. The fake score and teacher see the same detached query and
-  sigmas. `draw_exit_index()` draws `k` once per update for every microbatch and rank.
+  sigmas. `draw_exit_index(update)` draws `k` from `stream_seed(seed, "exit", update)`;
+  every microbatch and rank of the update shares it.
 
 `predict` receives per-sample FP32 `(B,)` sigmas. CFG applies only to the teacher.
 
-`compute_loss(trajectory, stage, data, loss_function, exit_index=..., dp_group=...)` returns weighted
+`compute_loss(trajectory, stage, data, loss_function, exit_index=..., keys=..., dp_group=...)` returns weighted
 loss, per-modality metrics, and a nonfinite flag. Bind the public loss wrapper with
 `loss_mode="dmd2"`; supply positive integer `gradient_accumulation_steps` and
 `sp_size` in the `TensorDict`. The wrapper applies these scales once. Use `sp_size=1`
@@ -86,20 +95,9 @@ when gathering whole-sample outputs already scales backward.
 `training_stages()` returns `fake_update_ratio` fake-score attempts followed by one
 student attempt. The caller executes backward and optimizer updates, owns clipping,
 schedulers, EMA and checkpoints, and handles reduction and skipped updates across ranks.
-For resume, each rank saves these RNG states at the same training boundary:
-
-| State | Owner and use |
-| --- | --- |
-| `program.state_dict()` | Private CPU generator for exit indices only. |
-| Global CPU RNG | `torch.get_rng_state()` / `torch.set_rng_state()`; score ratios and critic times, plus any CPU tensor noise. |
-| Used accelerator RNGs | Device backend's `get_rng_state` / `set_rng_state` (or `*_all`); initial noise, renoise sampling, fresh query and critic noise, and model randomness. |
-
-`seed` and `load_state_dict()` affect only exit indices. Restore caller-owned CPU,
-device, data-loader and other RNG states after model loading, before sampling the
-next initial latents. Coordinate streams within model-parallel groups and use
-independent streams across data-parallel replicas. Critic times are drawn in `modality_shifts` order and
-noise in the order of the latent dict, so a resumed run must keep both orders. RNG restoration does not ensure
-deterministic backend kernels or reductions.
+A resume needs no RNG state: the update number and the global sample numbers rebuild
+every draw, as in the PDMD reference (https://github.com/ZeamoxWang/pdmd, `training/train.py`).
+Keyed draws do not make backend kernels or reductions deterministic.
 
 With the repository's normal dependencies installed, run the CPU tests with:
 

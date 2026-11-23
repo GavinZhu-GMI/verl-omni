@@ -151,6 +151,55 @@ def register_diffusion_trainer(name: str):
     return decorator
 
 
+def checkpoint_root(trainer_config) -> str:
+    """``trainer.default_local_dir`` as an absolute path."""
+    root = trainer_config.default_local_dir
+    return root if os.path.isabs(root) else os.path.join(os.getcwd(), root)
+
+
+def actor_checkpoint_paths(trainer_config, step: int) -> tuple[str, str | None]:
+    """The actor folder of the checkpoint at ``step`` under ``trainer.default_local_dir``, and under
+    ``trainer.default_hdfs_dir`` (None when that is unset)."""
+    folder = os.path.join(f"global_step_{step}", "actor")
+    remote = trainer_config.default_hdfs_dir
+    remote_folder = None if remote is None else os.path.join(remote, folder)
+    return os.path.join(checkpoint_root(trainer_config), folder), remote_folder
+
+
+def mark_latest_checkpoint(trainer_config, step: int) -> None:
+    """Record ``step`` as the latest checkpoint under ``trainer.default_local_dir``, for ``resume_mode=auto``."""
+    root = checkpoint_root(trainer_config)
+    os.makedirs(root, exist_ok=True)
+    with open(os.path.join(root, "latest_checkpointed_iteration.txt"), "w") as latest:
+        latest.write(str(step))
+
+
+def resume_point(folder: str) -> tuple[int, str]:
+    """The step of a ``global_step_<n>`` checkpoint folder, and its actor folder."""
+    return int(folder.split("global_step_")[-1]), os.path.join(folder, "actor")
+
+
+def resolve_resume_folder(trainer_config) -> str | None:
+    """The absolute ``global_step_<n>`` folder ``trainer.resume_mode`` names, or None to train from scratch.
+
+    Raises:
+        ValueError: ``resume_mode`` is unknown, or ``resume_path`` comes without one ``resume_from_path`` string.
+    """
+    if trainer_config.resume_mode == "disable":
+        return None
+    if trainer_config.resume_mode == "auto":
+        return find_latest_ckpt_path(checkpoint_root(trainer_config))  # None if no latest
+    if trainer_config.resume_mode == "resume_path":
+        folder = trainer_config.resume_from_path
+        if not isinstance(folder, str):
+            raise ValueError(f"trainer.resume_mode=resume_path needs one trainer.resume_from_path, got {folder!r}")
+        return folder if os.path.isabs(folder) else os.path.join(os.getcwd(), folder)
+    raise ValueError(
+        f"Unknown trainer.resume_mode={trainer_config.resume_mode!r}. "
+        "Available options: ['disable', 'auto', 'resume_path']."
+    )
+
+
 def get_diffusion_trainer_cls(name: str):
     """Return the diffusion v1 trainer class registered under ``name``."""
     try:
@@ -1975,19 +2024,14 @@ class PolicyGradientDiffusionTrainerV1(ABC):
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
-        local_global_step_folder = os.path.join(
-            self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
-        )
+        actor_local_path, actor_remote_path = actor_checkpoint_paths(self.config.trainer, self.global_steps)
+        local_global_step_folder = os.path.dirname(actor_local_path)
         logger.info(f"Saving diffusion checkpoint to {local_global_step_folder}")
-        actor_local_path = os.path.join(local_global_step_folder, "actor")
-        actor_remote_path = (
-            None
-            if self.config.trainer.default_hdfs_dir is None
-            else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
-        )
-        max_actor_ckpt_to_keep = self.config.trainer.get("max_actor_ckpt_to_keep", None)
         self.actor_rollout_wg.save_checkpoint(
-            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+            actor_local_path,
+            actor_remote_path,
+            self.global_steps,
+            max_ckpt_to_keep=self.config.trainer.max_actor_ckpt_to_keep,
         )
 
         local_mkdir_safe(local_global_step_folder)
@@ -1999,37 +2043,19 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 metadata={"global_steps": self.global_steps},
             )
 
-        latest = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
-        with open(latest, "w") as f:
-            f.write(str(self.global_steps))
+        mark_latest_checkpoint(self.config.trainer, self.global_steps)
 
     def _load_checkpoint(self):
         self.global_steps = 0
-        if self.config.trainer.resume_mode == "disable":
+        global_step_folder = resolve_resume_folder(self.config.trainer)
+        if global_step_folder is None:
+            logger.info("Training from scratch")
             return
-        if self.config.trainer.resume_mode == "auto":
-            checkpoint_folder = self.config.trainer.default_local_dir
-            if not os.path.isabs(checkpoint_folder):
-                checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
-            global_step_folder = find_latest_ckpt_path(checkpoint_folder)
-            if global_step_folder is None:
-                logger.info("Training from scratch")
-                return
-        elif self.config.trainer.resume_mode == "resume_path":
-            assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
-            global_step_folder = self.config.trainer.resume_from_path
-            if not os.path.isabs(global_step_folder):
-                global_step_folder = os.path.join(os.getcwd(), global_step_folder)
-        else:
-            raise ValueError(
-                f"Unknown trainer.resume_mode={self.config.trainer.resume_mode!r}. "
-                "Available options: ['disable', 'auto', 'resume_path']."
-            )
 
-        self.global_steps = int(global_step_folder.split("global_step_")[-1])
+        self.global_steps, actor_folder = resume_point(global_step_folder)
         logger.info(f"Resuming diffusion from {global_step_folder}, global_steps={self.global_steps}")
         self.actor_rollout_wg.load_checkpoint(
-            os.path.join(global_step_folder, "actor"),
+            actor_folder,
             del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
         )
         dataloader_path = os.path.join(global_step_folder, "data.pt")

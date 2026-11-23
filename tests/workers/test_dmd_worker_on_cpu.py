@@ -232,6 +232,8 @@ def test_a_dmd_actor_without_a_dmd_config_is_refused_instead_of_training_on_defa
             ["data.seed=0", "data.latent_meta_buckets=[[8,10,2,4,4,5],[16,10,4,4,4,5]]"],
             "Several data.latent_meta_buckets need dmd.student_micro_batch_size_per_gpu",
         ),
+        (["data.shuffle=false"], "data.shuffle"),
+        (["data.sampler.class_path=some.Sampler"], "data.sampler.class_path"),
     ],
 )
 def test_a_dataloader_config_the_dmd_engine_cannot_train_on_is_refused_by_name(tmp_path, overrides, message):

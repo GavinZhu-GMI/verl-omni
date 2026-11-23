@@ -75,9 +75,19 @@ def engine(process_group):
 
 
 def batch(stage: str, prompts: tuple[int, ...], **batch_settings) -> TensorDict:
-    """A ``stage`` batch of one prompt id per row, with the batch settings the training worker sets."""
-    data = TensorDict({"prompt_ids": torch.tensor(prompts, dtype=torch.long).view(-1, 1)}, batch_size=[len(prompts)])
-    tu.assign_non_tensor(data, dmd_stage=stage, **{"use_dynamic_bsz": False, **batch_settings})
+    """A ``stage`` batch of one prompt id per row, with the batch settings the training worker sets.
+
+    A fake_score batch is update 0 and a student batch update 1, unless ``dmd_update`` says otherwise.
+    """
+    data = TensorDict(
+        {
+            "prompt_ids": torch.tensor(prompts, dtype=torch.long).view(-1, 1),
+            "global_sample": torch.arange(len(prompts)),
+        },
+        batch_size=[len(prompts)],
+    )
+    settings = {"use_dynamic_bsz": False, "dmd_update": int(stage == "student"), **batch_settings}
+    tu.assign_non_tensor(data, dmd_stage=stage, **settings)
     return data
 
 
@@ -128,7 +138,6 @@ def test_student_loss_reads_the_microbatch_of_the_kept_rollout(engine):
 @pytest.mark.parametrize(
     "earlier, student_prompts",
     [
-        ((), (0, 1)),  # the run starts with a student update
         ((("fake_score", (0, 1)), ("student", (0, 1))), (0, 1)),  # each rollout serves one student update
         ((("fake_score", (0, 1)), ("fake_score", (0,))), (0, 1)),  # the last fake_score update kept one slot
         ((("fake_score", (0, 1)),), (0,)),  # the last fake_score update kept two slots
@@ -144,16 +153,73 @@ def test_student_without_its_kept_rollouts_fails_before_any_forward(engine, earl
     assert len(RecordingDMDModel.calls) == forwards
 
 
+def test_a_fresh_engines_student_update_rebuilds_the_rollouts_of_the_update_before(process_group):
+    """After a resume no rollout is kept: the student rolls its batch out again on the keys of the update before, and
+    trains as it would on the rollouts that update kept (pdmd ``training/train.py`` rebuilds them the same way)."""
+    straight = build_engine()
+    train(straight, "fake_score", prompts=(0, 1), dmd_update=4)
+    kept = train(straight, "student", prompts=(0, 1), dmd_update=5)
+    resumed = build_engine()
+    torch.manual_seed(77)  # the rebuild must not read the global RNG
+
+    rebuilt = train(resumed, "student", prompts=(0, 1), dmd_update=5)
+
+    rollout, student = rebuilt[: 2 * 4], rebuilt[2 * 4 :]  # first the rollouts: two microbatches of four steps
+    assert all(call["adapter"] == "default" and not call["grad"] for call in rollout)
+    assert len(student) == len(kept)
+    for call, expected in zip(student, kept, strict=True):
+        assert call["prompts"] == expected["prompts"] and call["adapter"] == expected["adapter"]
+        torch.testing.assert_close(call["latents"], expected["latents"], rtol=0, atol=0)
+
+
+def test_rebuilt_rollouts_serve_one_student_update(process_group):
+    """A second student update on rollouts a fresh engine rebuilt fails as one on kept rollouts does."""
+    resumed = build_engine()
+    train(resumed, "student", prompts=(0, 1), dmd_update=5)
+    forwards = len(RecordingDMDModel.calls)
+
+    with pytest.raises(RuntimeError, match="fake_score update kept"):
+        train(resumed, "student", prompts=(0, 1), dmd_update=5)
+    assert len(RecordingDMDModel.calls) == forwards
+
+
+@pytest.mark.parametrize(
+    "fake_score_update, student_update, error",
+    [(3, 5, "kept those of update 3"), (0, 0, "dmd_update")],
+)
+def test_a_student_update_refuses_rollouts_of_another_update(engine, fake_score_update, student_update, error):
+    train(engine, "fake_score", prompts=(0, 1), dmd_update=fake_score_update)
+    forwards = len(RecordingDMDModel.calls)
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        train(engine, "student", prompts=(0, 1), dmd_update=student_update)
+    assert len(RecordingDMDModel.calls) == forwards
+
+
+@pytest.mark.parametrize("missing", ["dmd_update", "global_sample"])
+def test_a_batch_without_its_draw_keys_is_rejected_before_any_forward(engine, missing):
+    data = batch("fake_score", (0, 1))
+    del data[missing]
+    with pytest.raises(ValueError, match=missing):
+        engine.train_batch(data, LOSS)
+    assert RecordingDMDModel.calls == []
+
+
+def test_a_student_update_reports_its_keyed_exit_index(engine):
+    train(engine, "fake_score", prompts=(0, 1), dmd_update=10)
+    output = engine.train_batch(batch("student", (0, 1), dmd_update=11), LOSS)
+    assert output["metrics"]["dmd/exit_index"] == [float(engine._program.draw_exit_index(11))] * 2
+
+
 def test_a_failed_fake_score_update_keeps_no_rollout(engine, monkeypatch):
     """A rollout that raises mid-update leaves nothing for the student: neither its own first slots nor the rollouts
     of the update before it."""
     train(engine, "fake_score", prompts=(0, 1))
     initial_noise = RecordingDMDModel.dmd_initial_noise
 
-    def fail_on_prompt_one(cls, micro_batch):
+    def fail_on_prompt_one(cls, micro_batch, generators):
         if micro_batch["prompt_ids"].item() == 1:
             raise InterruptedError
-        return initial_noise(micro_batch)
+        return initial_noise(micro_batch, generators)
 
     monkeypatch.setattr(RecordingDMDModel, "dmd_initial_noise", classmethod(fail_on_prompt_one))
     with pytest.raises(InterruptedError):

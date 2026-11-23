@@ -14,14 +14,13 @@
 """The v1 ``distribution_matching`` trainer: DMD2 critic and student updates, one update per global step."""
 
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from numbers import Real
 from typing import Any
 
 import ray
 from omegaconf import OmegaConf
 from tensordict import TensorDict
-from torchdata.stateful_dataloader import StatefulDataLoader
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.trainer.ppo.utils import Role
 from verl.utils import tensordict_utils as tu
@@ -29,9 +28,15 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.metric import reduce_metrics
 from verl.utils.tracking import Tracking
 
-from verl_omni.trainer.diffusion.v1.trainer_base import register_diffusion_trainer
-from verl_omni.utils.dataset.prompt_cache_dataset import PromptCacheDataset, collate_prompt_features
-from verl_omni.utils.dataset.rl_dataset import create_rl_sampler
+from verl_omni.trainer.diffusion.v1.trainer_base import (
+    actor_checkpoint_paths,
+    mark_latest_checkpoint,
+    register_diffusion_trainer,
+    resolve_resume_folder,
+    resume_point,
+)
+from verl_omni.utils.dataset.prompt_cache_dataset import PromptCacheDataset, PromptCacheLoader
+from verl_omni.utils.dataset.prompt_stream import PromptStream
 from verl_omni.workers.config import DiffusionDMDConfig
 from verl_omni.workers.engine_workers import DMD_MODEL_TYPE, ActorRolloutRefWorker
 
@@ -96,7 +101,7 @@ class DistributionMatchingDiffusionTrainerV1:
     """
 
     actor_rollout_wg: Any  # the worker group of the DMD engine, built by init()
-    train_dataloader: Iterable[TensorDict]  # prompt batches, one per critic update, built by init()
+    train_dataloader: PromptCacheLoader  # prompt batches, one per critic update, built by init()
     logger: Any  # the per-step metric log, built by init()
 
     def __init__(self, config):
@@ -106,40 +111,89 @@ class DistributionMatchingDiffusionTrainerV1:
         self.global_steps = 0
 
     def init(self):
-        """Check the config, then build the dataloader, the worker group and the metric log."""
+        """Check the config, build the dataloader, the worker group and the metric log, then resume if
+        ``trainer.resume_mode`` finds a checkpoint."""
         check_dmd_update_config(self.config)
         self.train_dataloader = self._build_dataloader()
         self.actor_rollout_wg = self._build_worker_group()
         self.logger = self._build_logger()
+        self._load_checkpoint()
 
-    def _build_dataloader(self) -> StatefulDataLoader:
-        """Batches of ``data.train_batch_size`` precomputed prompts; the trainer loads no text encoder.
+    def _save_checkpoint(self) -> None:
+        """Save the engine's adapters and optimizers under ``global_step_<n>/actor`` and mark them the latest.
+
+        The step is the whole trainer state: the prompt stream and every random draw are keyed by update.
+        """
+        trainer = self.config.trainer
+        local, remote = actor_checkpoint_paths(trainer, self.global_steps)
+        self.actor_rollout_wg.save_checkpoint(
+            local, remote, self.global_steps, max_ckpt_to_keep=trainer.max_actor_ckpt_to_keep
+        )
+        mark_latest_checkpoint(trainer, self.global_steps)
+
+    def _load_checkpoint(self) -> None:
+        """Resume at the step of the checkpoint ``trainer.resume_mode`` names, if any.
+
+        The prompt stream restarts at that update; when it is a student update, at the critic update before it,
+        whose prompts the engine rebuilds the student's rollouts from.
 
         Raises:
-            ValueError: ``data.train_files`` is not one cache directory, ``data.latent_meta_buckets`` or ``data.seed``
-                is unset, or a microbatch could hold two latent geometries.
+            ValueError: ``trainer.resume_mode`` is unknown, or ``resume_path`` comes without one
+                ``trainer.resume_from_path``.
+        """
+        trainer = self.config.trainer
+        folder = resolve_resume_folder(trainer)
+        if folder is None:
+            return
+        self.global_steps, actor_folder = resume_point(folder)
+        self.actor_rollout_wg.load_checkpoint(actor_folder, del_local_after_load=trainer.del_local_ckpt_after_load)
+        stages = self.dmd_config.training_stages()
+        student_next = stages[self.global_steps % len(stages)] == "student"
+        self.train_dataloader.first_update = self.global_steps - 1 if student_next else self.global_steps
+
+    def _build_dataloader(self) -> PromptCacheLoader:
+        """Global batches of ``data.train_batch_size`` precomputed prompts, one per critic update, from the PDMD prompt
+        stream seeded by ``data.seed``; the trainer loads no text encoder. The loader reads in the trainer process.
+
+        Raises:
+            ValueError: ``data.shuffle`` is false or ``data.sampler.class_path`` is set, ``data.train_files`` is not
+                one cache directory, ``data.latent_meta_buckets`` or ``data.seed`` is unset or ``data.seed`` differs
+                from the engine's seed, or a microbatch could hold two latent geometries.
         """
         data = self.config.data
+        if not data.shuffle:
+            raise ValueError("data.shuffle=false: the PDMD prompt stream owns the prompt order; set it true.")
+        if data.sampler.class_path is not None:
+            raise ValueError(
+                f"data.sampler.class_path={data.sampler.class_path!r}: the PDMD prompt stream owns the prompt order; "
+                "unset it."
+            )
         if not isinstance(data.train_files, str):
             raise ValueError(f"data.train_files must be one prompt-cache directory, got {data.train_files!r}.")
         if data.latent_meta_buckets is None:
-            raise ValueError("Set data.latent_meta_buckets: the latent geometries a cached prompt draws from.")
+            raise ValueError("Set data.latent_meta_buckets: the latent geometries a prompt slot draws from.")
         if data.seed is None:
-            raise ValueError("Set data.seed: it seeds each prompt's draw from data.latent_meta_buckets.")
+            raise ValueError("Set data.seed: it seeds the prompt stream, its order and its latent geometries.")
         if len(data.latent_meta_buckets) > 1 and self.dmd_config.student_micro_batch_size_per_gpu > 1:
             raise ValueError(
                 "Several data.latent_meta_buckets need dmd.student_micro_batch_size_per_gpu=1: a microbatch shares one "
                 "latent geometry, and each prompt draws its own."
             )
-        dataset = PromptCacheDataset(data.train_files, OmegaConf.to_container(data.latent_meta_buckets), data.seed)
-        return StatefulDataLoader(
-            dataset=dataset,
-            batch_size=data.train_batch_size,
-            num_workers=data.dataloader_num_workers,
-            drop_last=True,
-            collate_fn=collate_prompt_features,
-            sampler=create_rl_sampler(data, dataset),
+        engine_seed = self.config.actor_rollout_ref.actor.fsdp_config.seed
+        if data.seed != engine_seed:
+            raise ValueError(
+                f"data.seed={data.seed} differs from actor_rollout_ref.actor.fsdp_config.seed={engine_seed}: the PDMD "
+                "reference keys the prompt stream and every random draw by one seed; set them equal."
+            )
+        dataset = PromptCacheDataset(data.train_files)
+        stream = PromptStream(
+            len(dataset),
+            data.train_batch_size,
+            self.dmd_config.fake_update_ratio,
+            [tuple(bucket) for bucket in OmegaConf.to_container(data.latent_meta_buckets)],
+            data.seed,
         )
+        return PromptCacheLoader(dataset, stream)
 
     def _build_worker_group(self) -> RayWorkerGroup:
         """One actor worker per GPU, each holding the DMD engine; no rollout or reference worker."""
@@ -172,7 +226,10 @@ class DistributionMatchingDiffusionTrainerV1:
         )
 
     def _prompt_batches(self) -> Iterator[TensorDict]:
-        """Yield prompt batches without end, one pass over ``train_dataloader`` per epoch."""
+        """Yield prompt batches without end, iterating ``train_dataloader`` again whenever it stops.
+
+        ``PromptCacheLoader`` never stops and crosses epochs itself; a finite loader is iterated again.
+        """
         while True:
             empty = True
             for batch in self.train_dataloader:
@@ -191,13 +248,14 @@ class DistributionMatchingDiffusionTrainerV1:
             position = self.global_steps % len(stages)
             stage = stages[position]
             self.global_steps += 1
-            if stage == "fake_score":
+            if stage == "fake_score" or batch is None:  # a run resumed at a student update has no batch yet
                 batch = next(batches)
             # one mini-batch and one epoch (check_dmd_update_config): a fake_score update keeps a rollout per
             # microbatch for the student update; the DMD engine splits by its own microbatch size, never dynamically
             tu.assign_non_tensor(
                 batch,
                 dmd_stage=stage,
+                dmd_update=self.global_steps - 1,  # 0-based over critic and student updates, as pdmd's iteration
                 mini_batch_size=actor.ppo_mini_batch_size,
                 epochs=actor.ppo_epochs,
                 dataloader_kwargs={"shuffle": False},
@@ -216,3 +274,6 @@ class DistributionMatchingDiffusionTrainerV1:
                 raise FloatingPointError(
                     f"Nonfinite metrics {nonfinite} at global_step={self.global_steps}, stage={label}"
                 )
+            save_freq = self.config.trainer.save_freq
+            if save_freq > 0 and (self.global_steps % save_freq == 0 or self.global_steps == self.total_training_steps):
+                self._save_checkpoint()

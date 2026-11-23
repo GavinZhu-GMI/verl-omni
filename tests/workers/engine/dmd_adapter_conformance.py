@@ -13,7 +13,7 @@
 # limitations under the License.
 """The contract every ``(architecture, dmd2)`` adapter keeps with the DMD engine, as checks over one adapter case.
 
-An adapter supplies ``dmd_condition(micro_batch)``, ``dmd_initial_noise(micro_batch)`` and
+An adapter supplies ``dmd_condition(micro_batch)``, ``dmd_initial_noise(micro_batch, generators)`` and
 ``dmd_predict(module, latents, sigmas, condition, negative)``, where ``sigmas`` maps each modality to a per-sample
 ``(B,)`` tensor.
 """
@@ -46,6 +46,11 @@ def _sigmas(names, batch: int) -> dict[str, torch.Tensor]:
     }
 
 
+def _generators(batch: int, seed: int = 0) -> list[torch.Generator]:
+    """One generator per row, each seeded apart."""
+    return [torch.Generator().manual_seed(seed * 1000 + row) for row in range(batch)]
+
+
 def _predict(case: AdapterCase, micro_batch: TensorDict, latents, sigmas) -> dict[str, torch.Tensor]:
     condition = case.adapter.dmd_condition(micro_batch)
     with torch.no_grad():
@@ -53,20 +58,27 @@ def _predict(case: AdapterCase, micro_batch: TensorDict, latents, sigmas) -> dic
 
 
 def check_initial_noise(case: AdapterCase) -> None:
-    """``dmd_initial_noise`` returns one tensor of batch size B per modality."""
+    """``dmd_initial_noise`` returns one tensor of batch size B per modality; row b draws from ``generators[b]``
+    alone, never from the global RNG."""
     batch = len(case.micro_batch)
     with case.context():
-        noise = case.adapter.dmd_initial_noise(case.micro_batch)
+        torch.manual_seed(1)
+        noise = case.adapter.dmd_initial_noise(case.micro_batch, _generators(batch))
+        torch.manual_seed(2)
+        again = case.adapter.dmd_initial_noise(case.micro_batch, _generators(batch))
+        last = case.adapter.dmd_initial_noise(case.micro_batch[batch - 1 :], _generators(batch)[batch - 1 :])
     assert noise
     for name, value in noise.items():
         assert isinstance(value, torch.Tensor), name
         assert value.shape[0] == batch, name
+        torch.testing.assert_close(again[name], value, rtol=0, atol=0)
+        torch.testing.assert_close(last[name][0], value[batch - 1], rtol=0, atol=0)
 
 
 def check_predict_keys_and_shapes(case: AdapterCase) -> None:
     """``dmd_predict`` returns the latents' keys and shapes."""
     with case.context():
-        latents = case.adapter.dmd_initial_noise(case.micro_batch)
+        latents = case.adapter.dmd_initial_noise(case.micro_batch, _generators(len(case.micro_batch)))
         prediction = _predict(case, case.micro_batch, latents, _sigmas(latents, len(case.micro_batch)))
     assert prediction.keys() == latents.keys()
     for name, value in latents.items():
@@ -76,7 +88,7 @@ def check_predict_keys_and_shapes(case: AdapterCase) -> None:
 def check_predict_is_repeatable(case: AdapterCase) -> None:
     """The same ``dmd_predict`` call twice returns equal outputs."""
     with case.context():
-        latents = case.adapter.dmd_initial_noise(case.micro_batch)
+        latents = case.adapter.dmd_initial_noise(case.micro_batch, _generators(len(case.micro_batch)))
         sigmas = _sigmas(latents, len(case.micro_batch))
         first = _predict(case, case.micro_batch, latents, sigmas)
         second = _predict(case, case.micro_batch, latents, sigmas)
@@ -87,7 +99,7 @@ def check_predict_is_repeatable(case: AdapterCase) -> None:
 def check_predict_is_per_sample(case: AdapterCase) -> None:
     """In a microbatch whose samples carry different sigmas, each sample's output equals that sample's alone."""
     with case.context():
-        latents = case.adapter.dmd_initial_noise(case.micro_batch)
+        latents = case.adapter.dmd_initial_noise(case.micro_batch, _generators(len(case.micro_batch)))
         sigmas = _sigmas(latents, len(case.micro_batch))
         batched = _predict(case, case.micro_batch, latents, sigmas)
         for index in range(len(case.micro_batch)):

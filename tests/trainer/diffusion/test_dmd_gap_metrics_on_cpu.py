@@ -63,13 +63,14 @@ def test_only_the_student_update_reports_the_gap_of_its_own_score_queries(stage)
     """The student update's gap comes from the fake and teacher estimates its own loss used."""
     program, _, initial, _ = make_program(("video", "audio"))
     reference, _, _, _ = make_program(("video", "audio"))
-    trajectory = program.rollout(initial)
+    keys = program.keys(0, tuple(range(next(iter(initial.values())).shape[0])))
+    trajectory = program.rollout(initial, keys=keys)
     data, loss_function = loss_inputs()
     stage_args = {"exit_index": 1} if stage == "student" else {}
     torch.manual_seed(5)
-    _, metrics, _ = program.compute_loss(trajectory, stage, data, loss_function, **stage_args)
+    _, metrics, _ = program.compute_loss(trajectory, stage, data, loss_function, **stage_args, keys=keys)
     torch.manual_seed(5)
-    expected = reference.stage_outputs(trajectory, stage, **stage_args)
+    expected = reference.stage_outputs(trajectory, stage, **stage_args, keys=reference.keys(0, keys.samples))
 
     gap_keys = {"dmd/critic_teacher_x0_gap", "dmd/critic_teacher_x0_equal"}
     if stage == "fake_score":

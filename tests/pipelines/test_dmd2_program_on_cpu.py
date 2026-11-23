@@ -74,6 +74,11 @@ def make_program(modalities=("image",), *, device="cpu", batch=2, **overrides):
     return DMD2Program(config, predict, seed=42), models, initial, calls
 
 
+def keys_of(program, latents, update=0):
+    """The draw keys of global samples ``0 .. B-1`` of ``update``."""
+    return program.keys(update, tuple(range(next(iter(latents.values())).shape[0])))
+
+
 def loss_inputs(accumulation=1, sp_size=1):
     data = TensorDict({}, batch_size=[2])
     tu.assign_non_tensor(data, gradient_accumulation_steps=accumulation, sp_size=sp_size)
@@ -110,7 +115,7 @@ SHIFT2_GRID = [1.0, 6 / 7, 2 / 3, 0.4, 0.0]
 def test_euler_rollout_keeps_every_state_and_follows_the_shifted_grid():
     program, calls = linear_program("euler")
     initial = {"image": torch.tensor([[1.0, -2.0], [0.5, 0.25]], dtype=torch.bfloat16)}
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     assert isinstance(trajectory, Trajectory)
     torch.testing.assert_close(trajectory.sigmas["image"], torch.tensor(SHIFT2_GRID))
     expected = initial["image"].float()
@@ -130,7 +135,7 @@ def test_euler_rollout_keeps_every_state_and_follows_the_shifted_grid():
 
 def test_each_modality_rolls_out_on_its_own_grid():
     program, _, initial, calls = make_program(("video", "audio"))
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     # shift 2 and shift 3 on linspace(1, 0, 5)
     torch.testing.assert_close(trajectory.sigmas["video"], torch.tensor(SHIFT2_GRID))
     torch.testing.assert_close(trajectory.sigmas["audio"], torch.tensor([1.0, 0.9, 0.75, 0.5, 0.0]))
@@ -142,14 +147,14 @@ def test_each_modality_rolls_out_on_its_own_grid():
 def test_renoise_rollout_draws_fresh_noise_at_each_inner_knot():
     program, _ = linear_program("renoise")
     initial = {"image": torch.tensor([[1.0, -2.0, 0.5]])}
-    torch.manual_seed(11)
-    trajectory = program.rollout(initial)
-    torch.manual_seed(11)
+    trajectory = program.rollout(initial, keys=program.keys(11, (5,)))
+    (generator,) = program.keys(11, (5,)).generators("rollout_renoise", "cpu")
     expected = initial["image"]
     for index in range(4):
         clean = expected - SHIFT2_GRID[index] * (0.5 * expected + 0.1 * SHIFT2_GRID[index])
         if index < 3:
-            expected = (1 - SHIFT2_GRID[index + 1]) * clean + SHIFT2_GRID[index + 1] * torch.randn(1, 3)
+            noise = torch.randn(3, generator=generator).unsqueeze(0)
+            expected = (1 - SHIFT2_GRID[index + 1]) * clean + SHIFT2_GRID[index + 1] * noise
         else:
             expected = clean
         torch.testing.assert_close(trajectory.states[index + 1]["image"], expected)
@@ -157,7 +162,8 @@ def test_renoise_rollout_draws_fresh_noise_at_each_inner_knot():
 
 def test_explicit_knots_are_shifted_per_modality():
     program, _ = linear_program("renoise", knots=[1.0, 0.75, 0.5, 0.25, 0.1, 0.04, 0.0], steps=6, shift=12.0)
-    trajectory = program.rollout({"image": torch.zeros(1, 2)})
+    initial = {"image": torch.zeros(1, 2)}
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     # knots 1000/750/500/250/100/40/0 (on a 1000 scale) through shift 12
     torch.testing.assert_close(
         trajectory.sigmas["image"], torch.tensor([1.0, 0.973, 0.923, 0.8, 0.571, 0.333, 0.0]), rtol=0, atol=5e-4
@@ -167,14 +173,12 @@ def test_explicit_knots_are_shifted_per_modality():
 
 def test_rollout_builds_no_graph_and_sample_returns_its_endpoint():
     program, models, initial, calls = make_program(("image", "audio"))
-    state = program.state_dict()
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     assert not any(value.requires_grad for step in trajectory.states for value in step.values())
     assert all(parameter.grad is None for parameter in models["student"].parameters())
-    sampled = program.sample(initial)
+    sampled = program.sample(initial, keys=keys_of(program, initial))
     for name in initial:
         torch.testing.assert_close(sampled[name], trajectory.states[-1][name], rtol=0, atol=0)
-    assert torch.equal(state["control_rng"], program.state_dict()["control_rng"])
     assert {call["role"] for call in calls} == {"student"}
 
 
@@ -186,9 +190,9 @@ def fake_score_call(calls):
 @pytest.mark.parametrize("modalities", [("image",), ("video", "audio")])
 def test_fake_score_regresses_on_the_rollout_endpoint_with_fresh_noise(modalities):
     program, models, initial, calls = make_program(modalities)
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     calls.clear()
-    outputs = program.stage_outputs(trajectory, "fake_score")
+    outputs = program.stage_outputs(trajectory, "fake_score", keys=keys_of(program, trajectory.states[0]))
     call = fake_score_call(calls)
     assert [c["role"] for c in calls] == ["fake_score"] and call["grad"]
     for name in modalities:
@@ -206,8 +210,8 @@ def test_fake_score_regresses_on_the_rollout_endpoint_with_fresh_noise(modalitie
 
 def test_trajectory_critic_noise_is_the_rollout_initial_noise():
     program, _, initial, _ = make_program(("video", "audio"), critic_noise="trajectory")
-    trajectory = program.rollout(initial)
-    outputs = program.stage_outputs(trajectory, "fake_score")
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
+    outputs = program.stage_outputs(trajectory, "fake_score", keys=keys_of(program, trajectory.states[0]))
     for name in ("video", "audio"):
         torch.testing.assert_close(outputs[name]["noise"], trajectory.states[0][name], rtol=0, atol=0)
 
@@ -216,7 +220,9 @@ def test_trajectory_critic_noise_is_the_rollout_initial_noise():
 def test_uniform_critic_time_follows_the_lead_modality_rule(modalities):
     """PDMD reference rule: video ~ U(0, 1); audio ~ U(0, 1), redrawn from U(0.85, 1) when video > 0.95."""
     program, _, initial, calls = make_program(modalities, batch=20000, critic_time_lead_modality="video")
-    program.stage_outputs(program.rollout(initial), "fake_score")
+    program.stage_outputs(
+        program.rollout(initial, keys=keys_of(program, initial)), "fake_score", keys=keys_of(program, initial)
+    )
     sigmas = fake_score_call(calls)["sigmas"]
     lead, follower = sigmas["video"], sigmas["audio"]
     assert bool(((lead >= 0) & (lead <= 1) & (follower >= 0) & (follower <= 1)).all())
@@ -232,8 +238,8 @@ def test_uniform_critic_time_follows_the_lead_modality_rule(modalities):
 
 def test_query_matched_critic_time_shares_one_step_and_ratio_across_modalities():
     program, _, initial, calls = make_program(("video", "audio"), batch=500, critic_time="query_matched")
-    trajectory = program.rollout(initial)
-    program.stage_outputs(trajectory, "fake_score")
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
+    program.stage_outputs(trajectory, "fake_score", keys=keys_of(program, trajectory.states[0]))
     sigmas = fake_score_call(calls)["sigmas"]
     video_grid, audio_grid = trajectory.sigmas["video"], trajectory.sigmas["audio"]
     for sample in range(500):
@@ -250,7 +256,12 @@ def test_query_matched_critic_time_shares_one_step_and_ratio_across_modalities()
 def test_fake_score_stage_rejects_an_exit_index():
     program, _, initial, _ = make_program()
     with pytest.raises(ValueError, match="exit_index"):
-        program.stage_outputs(program.rollout(initial), "fake_score", exit_index=0)
+        program.stage_outputs(
+            program.rollout(initial, keys=keys_of(program, initial)),
+            "fake_score",
+            exit_index=0,
+            keys=keys_of(program, initial),
+        )
 
 
 def by_role(calls, role, negative=False):
@@ -266,9 +277,9 @@ def student_velocity(models, name, latents, sigma):
 @pytest.mark.parametrize("exit_index", range(4))
 def test_student_reforwards_once_at_the_exit_state_and_trains_only_itself(exit_index, sampler):
     program, models, initial, calls = make_program(("video", "audio"), sampler=sampler)
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     calls.clear()
-    outputs = program.stage_outputs(trajectory, "student", exit_index)
+    outputs = program.stage_outputs(trajectory, "student", exit_index, keys=keys_of(program, trajectory.states[0]))
     assert [(call["role"], call["grad"]) for call in calls] == [
         ("student", True),
         ("fake_score", False),
@@ -293,9 +304,9 @@ def test_student_reforwards_once_at_the_exit_state_and_trains_only_itself(exit_i
 def test_score_query_time_lies_below_the_exit_step_and_critic_and_teacher_see_one_input():
     exit_index = 1
     program, _, initial, calls = make_program(("video", "audio"), batch=300)
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     calls.clear()
-    program.stage_outputs(trajectory, "student", exit_index)
+    program.stage_outputs(trajectory, "student", exit_index, keys=keys_of(program, trajectory.states[0]))
     (fake,), (teacher,) = by_role(calls, "fake_score"), by_role(calls, "teacher")
     ratios = {}
     for name in ("video", "audio"):
@@ -320,9 +331,9 @@ def query_noise(outputs, calls, name):
 @pytest.mark.parametrize("exit_index", [0, 2])
 def test_student_estimate_query_noise_is_the_students_own_noise_estimate(exit_index):
     program, models, initial, calls = make_program(("video", "audio"))
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     calls.clear()
-    outputs = program.stage_outputs(trajectory, "student", exit_index)
+    outputs = program.stage_outputs(trajectory, "student", exit_index, keys=keys_of(program, trajectory.states[0]))
     for name in ("video", "audio"):
         start, sigma = trajectory.states[exit_index][name], trajectory.sigmas[name][exit_index]
         with torch.no_grad():
@@ -334,15 +345,15 @@ def test_student_estimate_query_noise_is_the_students_own_noise_estimate(exit_in
 
 def test_trajectory_and_fresh_query_noise():
     program, _, initial, calls = make_program(("video", "audio"), score_query_noise="trajectory")
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     calls.clear()
-    outputs = program.stage_outputs(trajectory, "student", 2)
+    outputs = program.stage_outputs(trajectory, "student", 2, keys=keys_of(program, trajectory.states[0]))
     for name in ("video", "audio"):
         torch.testing.assert_close(query_noise(outputs, calls, name), trajectory.states[0][name], rtol=1e-4, atol=1e-4)
     program, models, initial, calls = make_program(("video", "audio"), score_query_noise="fresh")
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     calls.clear()
-    outputs = program.stage_outputs(trajectory, "student", 2)
+    outputs = program.stage_outputs(trajectory, "student", 2, keys=keys_of(program, trajectory.states[0]))
     for name in ("video", "audio"):
         used = query_noise(outputs, calls, name)
         start, sigma = trajectory.states[2][name], trajectory.sigmas[name][2]
@@ -354,9 +365,9 @@ def test_trajectory_and_fresh_query_noise():
 
 def test_critic_and_teacher_endpoints_use_their_own_velocities_at_the_query():
     program, models, initial, calls = make_program()
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     calls.clear()
-    outputs = program.stage_outputs(trajectory, "student", 3)
+    outputs = program.stage_outputs(trajectory, "student", 3, keys=keys_of(program, trajectory.states[0]))
     (fake,) = by_role(calls, "fake_score")
     query, sigma = fake["latents"]["image"], fake["sigmas"]["image"].view(-1, 1, 1)
     with torch.no_grad():
@@ -368,9 +379,9 @@ def test_critic_and_teacher_endpoints_use_their_own_velocities_at_the_query():
 @pytest.mark.parametrize("guidance,norm", [(1.0, "none"), (4.0, "none"), (4.0, "layer_norm"), (4.0, "scalar")])
 def test_teacher_cfg_uses_only_detached_teacher_predictions(guidance, norm):
     program, models, initial, calls = make_program(teacher_guidance_scale=guidance, cfg_norm=norm)
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     calls.clear()
-    program.stage_outputs(trajectory, "student", 1)
+    program.stage_outputs(trajectory, "student", 1, keys=keys_of(program, trajectory.states[0]))
     teacher_calls = [(call["negative"], call["grad"]) for call in calls if call["role"] == "teacher"]
     assert teacher_calls == [(False, False)] + ([(True, False)] if guidance != 1 else [])
     assert all(parameter.grad is None for parameter in models["teacher"].parameters())
@@ -378,9 +389,9 @@ def test_teacher_cfg_uses_only_detached_teacher_predictions(guidance, norm):
 
 def test_layer_norm_cfg_matches_packed_feature_axis_formula():
     program, _, initial, calls = make_program(teacher_guidance_scale=4.0, cfg_norm="layer_norm")
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     calls.clear()
-    outputs = program.stage_outputs(trajectory, "student", 2)
+    outputs = program.stage_outputs(trajectory, "student", 2, keys=keys_of(program, trajectory.states[0]))
     (fake,) = by_role(calls, "fake_score")
     query, sigma = fake["latents"]["image"], fake["sigmas"]["image"].view(-1, 1, 1)
     _, models, _, _ = make_program(teacher_guidance_scale=4.0, cfg_norm="layer_norm")
@@ -395,10 +406,10 @@ def test_layer_norm_cfg_matches_packed_feature_axis_formula():
 @pytest.mark.parametrize("exit_index", [None, -1, 4, True, 1.0])
 def test_student_stage_needs_a_valid_exit_index(exit_index):
     program, _, initial, calls = make_program()
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     calls.clear()
     with pytest.raises(ValueError, match="exit_index"):
-        program.stage_outputs(trajectory, "student", exit_index)
+        program.stage_outputs(trajectory, "student", exit_index, keys=keys_of(program, trajectory.states[0]))
     assert not calls
 
 
@@ -407,7 +418,7 @@ def test_layer_norm_cfg_rejects_unpacked_layout_before_any_forward(shape):
     program, _, _, calls = make_program(teacher_guidance_scale=4.0, cfg_norm="layer_norm")
     trajectory = Trajectory(states=[{"image": torch.ones(shape)}] * 5, sigmas={"image": torch.linspace(1, 0, 5)})
     with pytest.raises(ValueError, match="packed"):
-        program.stage_outputs(trajectory, "student", 0)
+        program.stage_outputs(trajectory, "student", 0, keys=keys_of(program, trajectory.states[0]))
     assert not calls
 
 
@@ -417,9 +428,9 @@ def test_unpacked_latents_remain_supported_without_layer_norm_cfg():
         name: 0.5 * value + sigmas[name].view(-1, 1, 1, 1) for name, value in latents.items()
     }
     initial = {"image": torch.ones(2, 3, 4, 3)}
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     for stage, index in (("student", 2), ("fake_score", None)):
-        outputs = program.stage_outputs(trajectory, stage, index)
+        outputs = program.stage_outputs(trajectory, stage, index, keys=keys_of(program, trajectory.states[0]))
         assert outputs["image"]["generated_x0"].shape == initial["image"].shape
 
 
@@ -434,13 +445,17 @@ def test_loss_wrapper_scaling_and_gradients_match_hand_arithmetic(stage, modalit
     """Stage outputs come from the program; the loss arithmetic on them is written out by hand."""
     actual, models, initial, _ = make_program(modalities, teacher_guidance_scale=4.0)
     reference, expected_models, _, _ = make_program(modalities, teacher_guidance_scale=4.0)
-    trajectory = actual.rollout(initial)
+    trajectory = actual.rollout(initial, keys=keys_of(actual, initial))
     before = {role: copy.deepcopy(model.state_dict()) for role, model in models.items()}
     data, loss_function = loss_inputs(accumulation, sp_size)
     torch.manual_seed(107)
-    actual_loss, metrics, invalid = actual.compute_loss(trajectory, stage, data, loss_function, **stage_args(stage))
+    actual_loss, metrics, invalid = actual.compute_loss(
+        trajectory, stage, data, loss_function, **stage_args(stage), keys=keys_of(actual, trajectory.states[0])
+    )
     torch.manual_seed(107)
-    outputs = reference.stage_outputs(trajectory, stage, **stage_args(stage))
+    outputs = reference.stage_outputs(
+        trajectory, stage, **stage_args(stage), keys=keys_of(reference, trajectory.states[0])
+    )
     expected_loss = 0
     for name, output in outputs.items():
         generated = output["generated_x0"]
@@ -483,12 +498,14 @@ def test_pdmd_settings_reach_the_registered_loss():
     settings = {"projected": True, "surrogate_scale": 1.0, "loss_clamp": 5.0}
     actual, _, initial, _ = make_program(("video", "audio"), **settings)
     reference, _, _, _ = make_program(("video", "audio"), **settings)
-    trajectory = actual.rollout(initial)
+    trajectory = actual.rollout(initial, keys=keys_of(actual, initial))
     data, loss_function = loss_inputs()
     torch.manual_seed(107)
-    actual_loss, _, _ = actual.compute_loss(trajectory, "student", data, loss_function, exit_index=2)
+    actual_loss, _, _ = actual.compute_loss(
+        trajectory, "student", data, loss_function, exit_index=2, keys=keys_of(actual, trajectory.states[0])
+    )
     torch.manual_seed(107)
-    outputs = reference.stage_outputs(trajectory, "student", 2)
+    outputs = reference.stage_outputs(trajectory, "student", 2, keys=keys_of(reference, trajectory.states[0]))
     expected_loss = 0
     for name, output in outputs.items():
         gradient, _, _ = dmd_gradient(
@@ -500,49 +517,131 @@ def test_pdmd_settings_reach_the_registered_loss():
     assert tu.get_non_tensor_data(data, "dmd_config", default=None) is actual.config
 
 
-@pytest.mark.parametrize("stage", ["student", "fake_score"])
-def test_resume_with_exit_rng_and_caller_rngs_reproduces_the_next_gradient(stage):
-    program, models, initial, _ = make_program(("video", "audio"))
-    program.draw_exit_index()
-    saved, cpu_rng = program.state_dict(), torch.get_rng_state()
+RANDOM_DRAWS = {  # every setting under which the program draws at random
+    "sampler": "renoise",
+    "critic_noise": "fresh",
+    "score_query_noise": "fresh",
+}
+
+
+def keyed_run(stage, keys_update, global_rng_seed, critic_time="uniform", batch=2):
+    """Roll out on the keys of update ``keys_update - 1`` for a student, ``keys_update`` for a fake score; return the
+    loss, the trained role's gradients and the rollout. No draw may touch the global CPU RNG."""
+    program, models, initial, _ = make_program(("video", "audio"), batch=batch, critic_time=critic_time, **RANDOM_DRAWS)
+    samples = tuple(range(batch))
+    torch.manual_seed(global_rng_seed)
+    global_rng = torch.get_rng_state()
+    rollout_update = keys_update - 1 if stage == "student" else keys_update
+    trajectory = program.rollout(initial, keys=program.keys(rollout_update, samples))
+    exit_index = program.draw_exit_index(keys_update) if stage == "student" else None
     data, loss_function = loss_inputs()
-    trajectory = program.rollout(initial)
-    exit_index = program.draw_exit_index() if stage == "student" else None
-    loss, _, _ = program.compute_loss(trajectory, stage, data, loss_function, exit_index=exit_index)
+    loss, _, _ = program.compute_loss(
+        trajectory, stage, data, loss_function, exit_index=exit_index, keys=program.keys(keys_update, samples)
+    )
     loss.backward()
-    expected = [parameter.grad.clone() for parameter in models[stage].parameters()]
-    resumed, resumed_models, _, _ = make_program(("video", "audio"))
-    before_load = torch.get_rng_state().clone()
-    resumed.load_state_dict(saved)
-    assert torch.equal(before_load, torch.get_rng_state())
-    torch.set_rng_state(cpu_rng)
-    trajectory = resumed.rollout(initial)
-    resumed_index = resumed.draw_exit_index() if stage == "student" else None
-    assert resumed_index == exit_index
-    actual, _, _ = resumed.compute_loss(trajectory, stage, data, loss_function, exit_index=resumed_index)
-    actual.backward()
-    torch.testing.assert_close(actual, loss, rtol=0, atol=0)
-    for parameter, gradient in zip(resumed_models[stage].parameters(), expected, strict=True):
-        torch.testing.assert_close(parameter.grad, gradient, rtol=0, atol=0)
+    assert torch.equal(torch.get_rng_state(), global_rng), "an update drew from the global CPU RNG"
+    return loss.detach(), [parameter.grad.clone() for parameter in models[stage].parameters()], trajectory
 
 
-def test_exit_index_is_drawn_from_its_own_rng_over_every_step():
+@pytest.mark.parametrize("critic_time", ["uniform", "query_matched"])
+@pytest.mark.parametrize("stage", ["student", "fake_score"])
+def test_an_update_draws_from_its_keys_alone_and_leaves_the_global_rng_alone(stage, critic_time):
+    loss, gradients, _ = keyed_run(stage, 7, global_rng_seed=0, critic_time=critic_time)
+    again, again_gradients, _ = keyed_run(stage, 7, global_rng_seed=123, critic_time=critic_time)
+
+    torch.testing.assert_close(again, loss, rtol=0, atol=0)
+    for gradient, expected in zip(again_gradients, gradients, strict=True):
+        torch.testing.assert_close(gradient, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("stage", ["student", "fake_score"])
+def test_another_update_draws_other_numbers(stage):
+    loss, _, trajectory = keyed_run(stage, 7, global_rng_seed=0)
+    other, _, other_trajectory = keyed_run(stage, 13, global_rng_seed=0)
+    assert not torch.equal(loss, other)
+    assert not torch.equal(trajectory.states[-1]["video"], other_trajectory.states[-1]["video"])
+
+
+def test_a_sample_draws_its_own_numbers_in_any_microbatch():
+    """Sample 1 draws the same renoise sampler noise alone as beside sample 0, so microbatching and ranks do not
+    change a sample's draws."""
+    program, _, initial, _ = make_program(("video", "audio"), **RANDOM_DRAWS)
+    pair = program.rollout(initial, keys=program.keys(4, (0, 1)))
+    alone = program.rollout({name: value[1:] for name, value in initial.items()}, keys=program.keys(4, (1,)))
+    for name in initial:
+        torch.testing.assert_close(alone.states[-1][name][0], pair.states[-1][name][1], rtol=0, atol=0)
+    swapped = program.rollout(initial, keys=program.keys(4, (1, 0)))
+    assert not torch.equal(swapped.states[-1]["video"], pair.states[-1]["video"])
+
+
+DRAWS_ONLY = {  # settings under which the critic times and score ratios are the only random draws
+    "sampler": "euler",
+    "critic_noise": "trajectory",
+    "score_query_noise": "student_estimate",
+}
+
+
+@pytest.mark.parametrize(
+    "stage, critic_time", [("fake_score", "uniform"), ("fake_score", "query_matched"), ("student", "uniform")]
+)
+def test_a_sample_draws_its_own_critic_times_and_score_ratios_in_any_microbatch(stage, critic_time):
+    """The sigmas the fake score sees for sample 1 are the same alone as beside sample 0, and differ from sample 0's:
+    ``draws`` is keyed by the sample."""
+    program, _, initial, calls = make_program(("video", "audio"), critic_time=critic_time, **DRAWS_ONLY)
+    exit_index = 1 if stage == "student" else None
+
+    def fake_score_sigmas(samples, rows):
+        trajectory = program.rollout(
+            {name: value[rows] for name, value in initial.items()}, keys=program.keys(3, samples)
+        )
+        calls.clear()
+        program.stage_outputs(trajectory, stage, exit_index, keys=program.keys(4, samples))
+        (call,) = [call for call in calls if call["role"] == "fake_score"]
+        return call["sigmas"]
+
+    pair = fake_score_sigmas((0, 1), slice(None))
+    alone = fake_score_sigmas((1,), slice(1, None))
+    for name in pair:
+        torch.testing.assert_close(alone[name][0], pair[name][1], rtol=0, atol=0)
+    assert not torch.equal(pair["video"][0], pair["video"][1])
+
+
+def test_the_exit_index_is_pdmds_keyed_draw_of_the_update():
+    from tests.utils.dataset._prompt_stream_fixtures import pdmd_stream_seed
+
     program, _, _, _ = make_program()
-    cpu_rng = torch.get_rng_state()
-    draws = {program.draw_exit_index() for _ in range(200)}
-    assert draws == {0, 1, 2, 3}
-    assert torch.equal(cpu_rng, torch.get_rng_state())
+    before = torch.get_rng_state()
+    indices = [program.draw_exit_index(update) for update in range(200)]
+    expected = [
+        int(torch.randint(4, (1,), generator=torch.Generator().manual_seed(pdmd_stream_seed(42, "exit", update))))
+        for update in range(200)
+    ]
+    assert indices == expected
+    assert set(indices) == {0, 1, 2, 3}
+    assert torch.equal(before, torch.get_rng_state())
+
+
+def test_keys_must_name_one_sample_per_row():
+    program, _, initial, calls = make_program()
+    with pytest.raises(ValueError, match="samples"):
+        program.rollout(initial, keys=program.keys(0, (0,)))
+    assert not calls
 
 
 @pytest.mark.parametrize("stage", ["student", "fake_score"])
 def test_nonfinite_output_is_reported_to_the_update_owner(stage):
     program, models, initial, _ = make_program()
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     with torch.no_grad():
         models["fake_score"]["image"].weight.fill_(float("nan"))
     data, loss_function = loss_inputs()
     _, _, invalid = program.compute_loss(
-        trajectory, stage, data, loss_function, exit_index=0 if stage == "student" else None
+        trajectory,
+        stage,
+        data,
+        loss_function,
+        exit_index=0 if stage == "student" else None,
+        keys=keys_of(program, trajectory.states[0]),
     )
     assert invalid
 
@@ -551,12 +650,14 @@ def test_nonfinite_output_is_reported_to_the_update_owner(stage):
 @pytest.mark.parametrize("value", [None, 0, True, 1.5])
 def test_loss_scaling_must_be_explicit_before_any_forward(name, value):
     program, _, initial, calls = make_program()
-    trajectory = program.rollout(initial)
+    trajectory = program.rollout(initial, keys=keys_of(program, initial))
     calls.clear()
     data, loss_function = loss_inputs()
     tu.assign_non_tensor(data, **{name: value})
     with pytest.raises(ValueError, match=name):
-        program.compute_loss(trajectory, "student", data, loss_function, exit_index=0)
+        program.compute_loss(
+            trajectory, "student", data, loss_function, exit_index=0, keys=keys_of(program, trajectory.states[0])
+        )
     assert not calls
 
 
@@ -577,13 +678,13 @@ def test_settings_the_program_does_not_read_are_rejected(kwargs):
 
 def test_invalid_stage_and_layout_fail_before_any_forward():
     program, _, initial, calls = make_program()
-    state = program.state_dict()
     for invalid in ({"other": torch.ones(2, 3)}, {"image": torch.ones(2)}, {"image": torch.empty(0, 3)}):
         with pytest.raises(ValueError):
-            program.rollout(invalid)
+            program.rollout(invalid, keys=keys_of(program, invalid))
     with pytest.raises(ValueError, match="Unknown DMD stage"):
-        program.stage_outputs(program.rollout(initial), "teacher")
-    assert torch.equal(state["control_rng"], program.state_dict()["control_rng"])
+        program.stage_outputs(
+            program.rollout(initial, keys=keys_of(program, initial)), "teacher", keys=keys_of(program, initial)
+        )
 
 
 @pytest.mark.parametrize("prediction", [{}, {"image": torch.zeros(2, 1, 3)}])
@@ -591,4 +692,4 @@ def test_prediction_layout_cannot_silently_broadcast(prediction):
     program, _, initial, _ = make_program()
     program.predict = lambda *args: prediction
     with pytest.raises(ValueError, match="Velocity predictions"):
-        program.rollout(initial)
+        program.rollout(initial, keys=keys_of(program, initial))

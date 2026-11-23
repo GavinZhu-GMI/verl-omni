@@ -14,12 +14,16 @@
 """Diffusers FSDP2 engine that trains several LoRA adapters of one frozen base, for DMD-style distillation."""
 
 import math
+import shutil
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 
 import torch
+import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
 from tensordict import TensorDict
+from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict, set_optimizer_state_dict
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id
@@ -64,7 +68,7 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
     trained adapter. FSDP2 only: each adapter clips its own gradients.
 
     The ``(architecture, dmd2)`` adapter registered for the model config supplies ``dmd_condition(micro_batch)``,
-    ``dmd_initial_noise(micro_batch)`` and ``dmd_predict(module, latents, sigmas, condition, negative)``.
+    ``dmd_initial_noise(micro_batch, generators)`` and ``dmd_predict(module, latents, sigmas, condition, negative)``.
     """
 
     def __init__(
@@ -88,8 +92,9 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
         self._model_adapter = DiffusionModelBase.get_class(model_config)
         self._program = DMD2Program(dmd_config, self._predict, engine_config.seed)
         self._condition: Any = _NO_CONDITION
-        # the last fake_score update's rollout, condition and microbatch, by slot
-        self._kept_rollouts: list[tuple[Trajectory, Any, TensorDict]] = []
+        # the last fake_score update's rollout, condition and microbatch, by slot; None until one update keeps them
+        self._kept_rollouts: Optional[list[tuple[Trajectory, Any, TensorDict]]] = None
+        self._kept_update = -1
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
 
     def _build_model_optimizer(self):
@@ -183,14 +188,85 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
     def _optimizers(self) -> list[torch.optim.Optimizer]:
         return [state.optimizer for state in self._adapter_optimizers.values()]
 
-    def save_checkpoint(self, *args, **kwargs) -> None:
-        raise NotImplementedError(
-            f"{type(self).__name__} cannot checkpoint yet: the checkpoint manager saves one optimizer, and every "
-            "other adapter's optimizer state would be lost."
-        )
+    def _checkpoint_state(self) -> dict[str, Any]:
+        """The trained state: each adapter's parameters, each adapter's optimizer and LR scheduler.
 
-    def load_checkpoint(self, *args, **kwargs) -> None:
-        raise NotImplementedError(f"{type(self).__name__} cannot load a checkpoint yet; see save_checkpoint.")
+        The adapter tensors are detached views of the parameters, so a load writes into the parameters. No RNG
+        state is part of it: every DMD draw is keyed by update and sample (``verl_omni.pipelines.dmd2.program``).
+        Each optimizer's state is read inside its adapter's stage: PEFT freezes the inactive adapters, and the
+        state-dict helpers skip frozen parameters.
+        """
+        trained = {
+            id(param)
+            for state in self._adapter_optimizers.values()
+            for group in state.optimizer.param_groups
+            for param in group["params"]
+        }
+        optimizers = {}
+        for name, state in self._adapter_optimizers.items():
+            with self.train_stage(name):
+                optimizers[name] = get_optimizer_state_dict(self.module, state.optimizer)
+        return {
+            "adapters": {
+                name: param.detach() for name, param in self.module.named_parameters() if id(param) in trained
+            },
+            "optimizers": optimizers,
+            "lr_schedulers": {
+                name: state.lr_scheduler.state_dict() for name, state in self._adapter_optimizers.items()
+            },
+        }
+
+    def _check_checkpoint_args(self, hdfs_path: Optional[str]) -> None:
+        if hdfs_path is not None:
+            raise NotImplementedError(f"{type(self).__name__} checkpoints to a local path only; got hdfs_path.")
+        if self.is_param_offload_enabled or self.is_optimizer_offload_enabled:
+            raise NotImplementedError(f"{type(self).__name__} cannot checkpoint with parameter or optimizer offload.")
+
+    def save_checkpoint(
+        self,
+        local_path: str,
+        hdfs_path: Optional[str] = None,
+        global_step: int = 0,
+        max_ckpt_to_keep: Optional[int] = None,
+        **kwargs,
+    ) -> None:
+        """Save every adapter's parameters, optimizer and LR scheduler as a sharded checkpoint under ``local_path``.
+
+        The base engine's checkpoint manager holds one optimizer; this engine trains one per adapter. The
+        checkpoint holds no RNG state. ``global_step`` is the caller's: the path names it.
+
+        Raises:
+            NotImplementedError: ``hdfs_path`` or ``max_ckpt_to_keep`` is set, or parameters or optimizer states
+                are offloaded.
+        """
+        self._check_checkpoint_args(hdfs_path)
+        if max_ckpt_to_keep is not None:
+            raise NotImplementedError(f"{type(self).__name__} keeps every checkpoint; unset max_ckpt_to_keep.")
+        dcp.save(self._checkpoint_state(), checkpoint_id=local_path)
+
+    def load_checkpoint(
+        self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: bool = True, **kwargs
+    ) -> None:
+        """Load what :meth:`save_checkpoint` saved into this engine's adapters, optimizers and LR schedulers.
+
+        No global or private RNG changes. Kept rollouts are not part of a checkpoint: the next student update
+        rebuilds them (see :meth:`forward_backward_batch`).
+
+        Raises:
+            NotImplementedError: ``hdfs_path`` is set, or parameters or optimizer states are offloaded.
+        """
+        self._check_checkpoint_args(hdfs_path)
+        state = self._checkpoint_state()
+        dcp.load(state, checkpoint_id=local_path)
+        for name, adapter_optimizer in self._adapter_optimizers.items():
+            with self.train_stage(name):  # see _checkpoint_state
+                set_optimizer_state_dict(self.module, adapter_optimizer.optimizer, state["optimizers"][name])
+            adapter_optimizer.lr_scheduler.load_state_dict(state["lr_schedulers"][name])
+        self._kept_rollouts, self._kept_update = None, -1
+        if del_local_after_load:
+            dist.barrier()
+            if dist.get_rank() == 0:
+                shutil.rmtree(local_path)
 
     @contextmanager
     def _conditioned(self, condition: Any) -> Iterator[None]:
@@ -226,29 +302,48 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
         with self.train_stage(_STAGE_ADAPTERS[self._stage_of(data)]):
             return super().train_batch(data, loss_function)
 
-    def _roll_out(self, micro_batches: list[TensorDict]) -> list[tuple[Trajectory, Any, TensorDict]]:
-        """Roll out each microbatch; return its rollout, condition and microbatch."""
+    def _roll_out(
+        self, micro_batches: list[TensorDict], samples: list[tuple[int, ...]], update: int
+    ) -> list[tuple[Trajectory, Any, TensorDict]]:
+        """Roll out each microbatch on the draw keys of its global ``samples`` in ``update``; return its rollout,
+        condition and microbatch."""
         rollouts = []
-        for micro_batch in micro_batches:
+        for micro_batch, micro_samples in zip(micro_batches, samples, strict=True):
             condition = self._model_adapter.dmd_condition(micro_batch)
+            keys = self._program.keys(update, micro_samples)
             with self._conditioned(condition):
-                trajectory = self._program.rollout(self._model_adapter.dmd_initial_noise(micro_batch))
+                generators = keys.generators("noise", micro_batch.device)
+                initial = self._model_adapter.dmd_initial_noise(micro_batch, generators)
+                trajectory = self._program.rollout(initial, keys=keys)
             rollouts.append((trajectory, condition, micro_batch))
         return rollouts
 
-    def _take_kept(self, slots: int) -> list[tuple[Trajectory, Any, TensorDict]]:
-        """Return the kept rollouts of ``slots`` microbatches and forget them.
+    def _student_rollouts(
+        self, micro_batches: list[TensorDict], samples: list[tuple[int, ...]], update: int
+    ) -> list[tuple[Trajectory, Any, TensorDict]]:
+        """Return the rollouts of the fake_score update before ``update``, kept or rebuilt, and forget the kept ones.
 
         The student reuses the last critic update's rollouts, as the reference implementation does
-        (https://github.com/ZeamoxWang/pdmd, ``training/train.py``).
+        (https://github.com/ZeamoxWang/pdmd, ``training/train.py``). An engine that has kept none since it was built,
+        as after a resume, rebuilds them from the student batch, which then holds that update's prompts, on that
+        update's draw keys.
 
         Raises:
-            RuntimeError: The last fake_score update kept a different number of rollouts.
+            RuntimeError: The last fake_score update kept a different number of rollouts, or kept them in another
+                update than the one before ``update``.
         """
-        if len(self._kept_rollouts) != slots:
+        if self._kept_rollouts is None:
+            rebuilt, self._kept_rollouts = self._roll_out(micro_batches, samples, update - 1), []
+            return rebuilt
+        if len(self._kept_rollouts) != len(micro_batches):
             raise RuntimeError(
-                f"The student update has {slots} microbatches, but the last fake_score update kept "
+                f"The student update has {len(micro_batches)} microbatches, but the last fake_score update kept "
                 f"{len(self._kept_rollouts)} rollouts; each rollout serves one student update"
+            )
+        if self._kept_update != update - 1:
+            raise RuntimeError(
+                f"The student update {update} trains on the rollouts of update {update - 1}, but the last "
+                f"fake_score update kept those of update {self._kept_update}"
             )
         kept, self._kept_rollouts = self._kept_rollouts, []
         return kept
@@ -259,12 +354,18 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
         ``train_batch`` opens the stage that ``data`` names; the stage, not ``data``, decides what runs here.
         A fake_score update rolls out each microbatch and, once all its gradients are accumulated, keeps the rollout,
         condition and microbatch of each slot; the next student update trains each slot on them, with one exit index
-        for all its microbatches. The student batch sets only the number of slots.
+        for all its microbatches. The student batch then sets only the number of slots; an engine that has kept no
+        rollout since it was built rolls them out again from the student batch.
+
+        Every random draw is keyed by ``data``'s ``dmd_update``, the 0-based update, and each row's ``global_sample``,
+        its index in the global batch (see :mod:`verl_omni.pipelines.dmd2.program`); a rebuilt rollout uses the keys
+        of update ``dmd_update - 1``. A student update reports its exit index as ``dmd/exit_index``.
 
         Raises:
             ValueError: ``forward_only`` is set, ``data`` is empty, asks for dynamic batch sizes or deferred
-                gradient sync, or does not split into whole microbatches.
-            RuntimeError: No stage is open, or a student update finds no kept rollout for each of its microbatches.
+                gradient sync, does not split into whole microbatches, or lacks ``dmd_update`` or ``global_sample``.
+            RuntimeError: No stage is open, or a student update finds the kept rollouts of another update or
+                another number of microbatches.
         """
         if forward_only:
             raise ValueError(f"{type(self).__name__} has no forward-only path.")
@@ -288,17 +389,27 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
         if len(data) % micro_batch_size:
             raise ValueError(f"A {stage} batch of {len(data)} does not split into microbatches of {micro_batch_size}.")
         slots = len(data) // micro_batch_size
+        update = tu.get_non_tensor_data(data, "dmd_update", default=None)
+        if isinstance(update, bool) or not isinstance(update, int) or update < (1 if stage == "student" else 0):
+            raise ValueError(
+                f"A {stage} batch needs its 0-based update as dmd_update, after a fake_score update for a student "
+                f"update; got {update!r}."
+            )
+        if "global_sample" not in data.keys():
+            raise ValueError(f"A {stage} batch needs global_sample, each row's index in the global batch.")
+        chunks = tu.chunk_tensordict(data, slots)
+        samples = [tuple(chunk["global_sample"].tolist()) for chunk in chunks]  # on the host, before the move
+        micro_batches = [chunk.to(get_device_id()) for chunk in chunks]
         if stage == "student":
-            slot_inputs = self._take_kept(slots)
-            exit_index = self._program.draw_exit_index()
+            slot_inputs = self._student_rollouts(micro_batches, samples, update)
+            exit_index = self._program.draw_exit_index(update)
         elif stage == "fake_score":
-            micro_batches = [micro_batch.to(get_device_id()) for micro_batch in tu.chunk_tensordict(data, slots)]
-            slot_inputs = self._roll_out(micro_batches)
+            slot_inputs = self._roll_out(micro_batches, samples, update)
             exit_index = None
         else:
             raise ValueError(f"Unknown DMD stage {stage!r}")
         losses, metrics = [], {}
-        for trajectory, condition, micro_batch in slot_inputs:
+        for (trajectory, condition, micro_batch), micro_samples in zip(slot_inputs, samples, strict=True):
             tu.assign_non_tensor(
                 micro_batch, gradient_accumulation_steps=slots, sp_size=self.ulysses_sequence_parallel_size
             )
@@ -309,16 +420,19 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
                     micro_batch,
                     loss_function,
                     exit_index=exit_index,
+                    keys=self._program.keys(update, micro_samples),
                     dp_group=self.get_data_parallel_group(),
                 )
             loss.backward()
             losses.append(loss.detach().item())
-            micro_metrics["dmd/nonfinite_outputs"] = float(invalid)
+            micro_metrics["dmd/nonfinite_fraction"] = float(invalid)
+            if exit_index is not None:
+                micro_metrics["dmd/exit_index"] = float(exit_index)
             for key, value in micro_metrics.items():
                 value = value.aggregate() if isinstance(value, Metric) else value
                 metrics.setdefault(key, []).append(float(value))  # one value per microbatch, as verl's engines
         if stage == "fake_score":
-            self._kept_rollouts = slot_inputs
+            self._kept_rollouts, self._kept_update = slot_inputs, update
         return {"loss": losses, "metrics": metrics, "model_output": {}}
 
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):

@@ -89,14 +89,26 @@ class MiniMaxH3DMD2(DiffusionModelBase):
         )
 
     @classmethod
-    def dmd_initial_noise(cls, micro_batch: TensorDict) -> dict[str, torch.Tensor]:
-        """Standard Gaussian FP32 video and audio rows of the microbatch's latent geometry, on its device."""
+    def dmd_initial_noise(cls, micro_batch: TensorDict, generators: list[torch.Generator]) -> dict[str, torch.Tensor]:
+        """Standard Gaussian FP32 video and audio rows of the microbatch's latent geometry, on its device.
+
+        Row ``b`` draws its video, then its audio, from ``generators[b]``.
+
+        Raises:
+            ValueError: ``generators`` does not hold one generator per row.
+        """
         latent_meta = _latent_meta(micro_batch)
-        batch, device = len(micro_batch), micro_batch["latent_meta"].device
-        return {
-            "video": torch.randn(batch, latent_meta[0], VIDEO_ROW_WIDTH, device=device, dtype=torch.float32),
-            "audio": torch.randn(batch, latent_meta[1], AUDIO_ROW_WIDTH, device=device, dtype=torch.float32),
-        }
+        device = micro_batch["latent_meta"].device
+        if len(generators) != len(micro_batch):
+            raise ValueError(f"dmd_initial_noise needs one generator per row: {len(generators)} for {len(micro_batch)}")
+        rows = [
+            (
+                torch.randn(latent_meta[0], VIDEO_ROW_WIDTH, generator=generator, device=device, dtype=torch.float32),
+                torch.randn(latent_meta[1], AUDIO_ROW_WIDTH, generator=generator, device=device, dtype=torch.float32),
+            )
+            for generator in generators
+        ]
+        return {"video": torch.stack([video for video, _ in rows]), "audio": torch.stack([audio for _, audio in rows])}
 
     @classmethod
     def dmd_predict(

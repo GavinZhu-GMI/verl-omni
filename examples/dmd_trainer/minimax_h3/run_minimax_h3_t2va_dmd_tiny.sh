@@ -33,7 +33,6 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     "data.val_files=$CACHE_DIR" \
     data.train_batch_size="$NUM_GPUS" \
     data.seed=42 \
-    data.dataloader_num_workers=0 \
     "data.latent_meta_buckets=[$LATENT_META]" \
     "actor_rollout_ref.model.path=$MODEL_PATH/FL2VA" \
     "actor_rollout_ref.model.config_path=$MODEL_PATH/transformer" \

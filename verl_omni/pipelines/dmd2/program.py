@@ -18,6 +18,11 @@ This module constructs inputs for the registered DMDLoss. Model construction,
 parameter updates, distributed contexts and checkpoint publication stay with
 the caller. No model adapter or training engine is imported here.
 
+Every random draw is keyed, as in the PDMD reference (https://github.com/ZeamoxWang/pdmd, ``training/train.py``):
+draw ``name`` of global sample ``sample`` in 0-based update ``update`` uses a generator seeded by
+``stream_seed(seed, name, update, sample)``, and the exit index one seeded by ``stream_seed(seed, "exit", update)``.
+An update thus reads no global RNG and no generator state, and a resumed run draws what a straight run draws.
+
 Noise-time convention: sigma=1 is pure noise, x_sigma = (1 - sigma) * x0 + sigma * z,
 and the predicted velocity is v = z - x0.
 """
@@ -32,9 +37,43 @@ from torch import Tensor
 from verl.utils import tensordict_utils as tu
 
 from verl_omni.trainer.diffusion.distillation.utils import standard_cfg, velocity_to_x0
+from verl_omni.utils.dataset.prompt_stream import stream_seed
 from verl_omni.workers.config.diffusion.dmd import DiffusionDMDConfig
 
-__all__ = ["DMD2Program", "Trajectory", "critic_teacher_x0_metrics", "training_grid"]
+__all__ = ["DMD2Program", "DrawKeys", "Trajectory", "critic_teacher_x0_metrics", "training_grid"]
+
+
+@dataclass(frozen=True)
+class DrawKeys:
+    """The keys of one microbatch's random draws: row ``b`` is global sample ``samples[b]`` of 0-based ``update``.
+
+    Use :meth:`DMD2Program.keys` to build one.
+    """
+
+    seed: int
+    update: int
+    samples: tuple[int, ...]
+
+    def generators(self, name: str, device: torch.device | str) -> list[torch.Generator]:
+        """One generator per row on ``device``, seeded by ``stream_seed(seed, name, update, sample)``."""
+        return [
+            torch.Generator(device=device).manual_seed(stream_seed(self.seed, name, self.update, sample))
+            for sample in self.samples
+        ]
+
+
+def _randn(generators: list[torch.Generator], like: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Standard Gaussian FP32 noise shaped as each modality of ``like`` ``(B, ...)``; row ``b`` draws from
+    ``generators[b]``, its modalities in ``like``'s order."""
+    device = next(iter(like.values())).device
+    rows = [
+        {
+            name: torch.randn(value.shape[1:], generator=generator, device=device, dtype=torch.float32)
+            for name, value in like.items()
+        }
+        for generator in generators
+    ]
+    return {name: torch.stack([row[name] for row in rows]) for name in like}
 
 
 @dataclass
@@ -114,11 +153,9 @@ class DMD2Program:
             tensor. Roles are ``student``, ``fake_score`` and ``teacher``; ``negative`` selects
             unconditional teacher inputs for CFG. With teacher ``layer_norm`` CFG, inputs and
             outputs must be packed ``(B, tokens, features)``.
-        seed: Seed for the exit-index RNG, shared across cooperating ranks.
+        seed: The seed of every draw key; every rank of a run passes the same one.
 
-    The caller saves the global CPU RNG (score and critic times) and each used device RNG
-    (noise) alongside ``state_dict``. Forward/recompute contexts and gradient reduction remain
-    caller-owned.
+    Forward/recompute contexts and gradient reduction remain caller-owned.
     """
 
     def __init__(
@@ -136,19 +173,16 @@ class DMD2Program:
                 raise ValueError(f"DMD2Program does not read {name}; leave it at its default")
         self.config = config
         self.predict = predict
-        self.control_rng = torch.Generator().manual_seed(seed)
+        self.seed = seed
 
-    def state_dict(self) -> dict[str, Tensor]:
-        """Capture exit selection; the caller separately saves CPU and device RNGs."""
-        return {"control_rng": self.control_rng.get_state()}
+    def keys(self, update: int, samples: tuple[int, ...]) -> DrawKeys:
+        """The draw keys of a microbatch whose rows are global ``samples`` of 0-based ``update``."""
+        return DrawKeys(self.seed, update, tuple(samples))
 
-    def load_state_dict(self, state: dict[str, Tensor]) -> None:
-        """Restore exit selection without modifying the global CPU or device RNGs."""
-        self.control_rng.set_state(state["control_rng"])
-
-    def draw_exit_index(self) -> int:
-        """Draw the student exit index for one update; every microbatch and rank of the update shares it."""
-        return int(torch.randint(self.config.num_inference_steps, (), generator=self.control_rng))
+    def draw_exit_index(self, update: int) -> int:
+        """The student exit index of 0-based ``update``; every microbatch and rank of the update shares it."""
+        generator = torch.Generator().manual_seed(stream_seed(self.seed, "exit", update))
+        return int(torch.randint(self.config.num_inference_steps, (1,), generator=generator))
 
     def _predict(
         self, role: str, latents: dict[str, Tensor], sigmas: dict[str, Tensor], negative: bool = False
@@ -160,7 +194,7 @@ class DMD2Program:
             raise ValueError("Velocity predictions must have the same shapes as the latents")
         return predictions
 
-    def _check_latents(self, initial: dict[str, Tensor]) -> None:
+    def _check_latents(self, initial: dict[str, Tensor], keys: DrawKeys) -> None:
         if initial.keys() != self.config.modality_shifts.keys():
             raise ValueError("Latent modalities must match modality_shifts and modality_weights")
         first = next(iter(initial.values()))
@@ -173,21 +207,24 @@ class DMD2Program:
             for value in initial.values()
         ):
             raise ValueError("Latents require nonempty floating (B, ...) tensors with a shared batch size and device")
+        if len(keys.samples) != first.shape[0]:
+            raise ValueError(f"The draw keys name {len(keys.samples)} samples for a batch of {first.shape[0]}")
 
     @torch.no_grad()
-    def rollout(self, initial: dict[str, Tensor]) -> Trajectory:
+    def rollout(self, initial: dict[str, Tensor], *, keys: DrawKeys) -> Trajectory:
         """Run the student for all ``num_inference_steps`` without autograd and keep every state.
 
         ``initial`` holds standard Gaussian noise of shape ``(B, ...)`` per modality. ``euler`` steps along
-        the predicted velocity; ``renoise`` jumps to the predicted x0 and adds fresh noise (global device
-        RNG) at the next knot.
+        the predicted velocity; ``renoise`` jumps to the predicted x0 and adds fresh noise, drawn under
+        ``keys`` as ``rollout_renoise``, at the next knot.
         """
-        self._check_latents(initial)
+        self._check_latents(initial, keys)
         first = next(iter(initial.values()))
         batch, device = first.shape[0], first.device
         grid = training_grid(self.config, device)
         state = {name: value.detach().float() for name, value in initial.items()}
         states = [state]
+        generators = keys.generators("rollout_renoise", device) if self.config.sampler == "renoise" else []
         for index in range(self.config.num_inference_steps):
             current = {name: grid[name][index] for name in state}
             following = {name: grid[name][index + 1] for name in state}
@@ -199,45 +236,49 @@ class DMD2Program:
                 }
             elif self.config.sampler == "renoise":
                 clean = {name: value - current[name] * velocities[name].float() for name, value in state.items()}
+                noise = _randn(generators, clean)
                 state = {
-                    name: (1 - following[name]) * value + following[name] * torch.randn_like(value)
-                    for name, value in clean.items()
+                    name: (1 - following[name]) * value + following[name] * noise[name] for name, value in clean.items()
                 }
             else:
                 raise ValueError(f"Unknown sampler {self.config.sampler!r}")
             states.append(state)
         return Trajectory(states=states, sigmas=grid)
 
-    def _critic_sigmas(self, trajectory: Trajectory) -> dict[str, Tensor]:
-        """Per-sample fake-score sigmas, drawn on the global CPU RNG."""
-        batch = next(iter(trajectory.states[0].values())).shape[0]
+    def _critic_sigmas(self, trajectory: Trajectory, keys: DrawKeys) -> dict[str, Tensor]:
+        """Per-sample fake-score sigmas, drawn on CPU under ``keys`` as ``draws``."""
         device = next(iter(trajectory.sigmas.values())).device
         names = list(self.config.modality_shifts)
+        generators = keys.generators("draws", "cpu")
         if self.config.critic_time == "uniform":
             lead = self.config.critic_time_lead_modality or names[0]
-            lead_sigma = torch.rand(batch)
+            followers = [name for name in names if name != lead]
+            # per row: the lead's sigma, then a draw and a redraw per follower
+            uniforms = torch.stack(
+                [torch.rand(1 + 2 * len(followers), generator=generator) for generator in generators]
+            )
+            lead_sigma = uniforms[:, 0]
             sigmas = {lead: lead_sigma}
             floor = self.config.critic_time_follower_floor
-            for name in names:
-                if name == lead:
-                    continue
-                draw, redraw = torch.rand(batch), torch.rand(batch)
+            for position, name in enumerate(followers):
+                draw, redraw = uniforms[:, 1 + 2 * position], uniforms[:, 2 + 2 * position]
                 sigmas[name] = torch.where(
                     lead_sigma > self.config.critic_time_lead_threshold, floor + (1 - floor) * redraw, draw
                 )
         elif self.config.critic_time == "query_matched":
-            step = torch.randint(self.config.num_inference_steps, (batch,)).to(device)
-            ratio = torch.rand(batch).to(device)
+            steps = self.config.num_inference_steps
+            step = torch.cat([torch.randint(steps, (1,), generator=generator) for generator in generators]).to(device)
+            ratio = torch.cat([torch.rand(1, generator=generator) for generator in generators]).to(device)
             sigmas = {name: _interval_sigma(trajectory.sigmas[name], step, ratio) for name in names}
         else:
             raise ValueError(f"Unknown critic_time {self.config.critic_time!r}")
         return {name: sigmas[name].to(device) for name in names}
 
-    def _fake_score_outputs(self, trajectory: Trajectory) -> dict[str, dict[str, Tensor]]:
+    def _fake_score_outputs(self, trajectory: Trajectory, keys: DrawKeys) -> dict[str, dict[str, Tensor]]:
         endpoint = trajectory.states[-1]
-        sigmas = self._critic_sigmas(trajectory)
+        sigmas = self._critic_sigmas(trajectory, keys)
         if self.config.critic_noise == "fresh":
-            noise = {name: torch.randn_like(value) for name, value in endpoint.items()}
+            noise = _randn(keys.generators("renoise", next(iter(endpoint.values())).device), endpoint)
         elif self.config.critic_noise == "trajectory":
             noise = trajectory.states[0]
         else:
@@ -249,7 +290,9 @@ class DMD2Program:
             for name, value in endpoint.items()
         }
 
-    def _student_outputs(self, trajectory: Trajectory, exit_index: Optional[int]) -> dict[str, dict[str, Tensor]]:
+    def _student_outputs(
+        self, trajectory: Trajectory, exit_index: Optional[int], keys: DrawKeys
+    ) -> dict[str, dict[str, Tensor]]:
         steps = self.config.num_inference_steps
         if isinstance(exit_index, bool) or not isinstance(exit_index, int) or not 0 <= exit_index < steps:
             raise ValueError(f"The student stage needs an integer exit_index in [0, {steps}), got {exit_index!r}")
@@ -266,7 +309,10 @@ class DMD2Program:
         start_sigmas = {name: grid[name][exit_index].repeat(batch) for name in start}
         velocity = self._predict("student", start, start_sigmas)
         clean = {name: _endpoint(value, velocity[name], start_sigmas[name]) for name, value in start.items()}
-        ratio = torch.rand(batch).to(device)  # one per sample, shared by every modality
+        # one per sample, shared by every modality
+        ratio = torch.cat([torch.rand(1, generator=generator) for generator in keys.generators("draws", "cpu")]).to(
+            device
+        )
         query_sigmas = {name: _interval_sigma(grid[name], exit_index, ratio) for name in start}
         with torch.no_grad():
             if self.config.score_query_noise == "student_estimate":
@@ -277,7 +323,7 @@ class DMD2Program:
             elif self.config.score_query_noise == "trajectory":
                 noise = trajectory.states[0]
             elif self.config.score_query_noise == "fresh":
-                noise = {name: torch.randn_like(value) for name, value in clean.items()}
+                noise = _randn(keys.generators("score_query", device), clean)
             else:
                 raise ValueError(f"Unknown score_query_noise {self.config.score_query_noise!r}")
             query = {name: _renoise(value.detach(), noise[name], query_sigmas[name]) for name, value in clean.items()}
@@ -297,19 +343,22 @@ class DMD2Program:
         }
 
     def stage_outputs(
-        self, trajectory: Trajectory, stage: str, exit_index: Optional[int] = None
+        self, trajectory: Trajectory, stage: str, exit_index: Optional[int] = None, *, keys: DrawKeys
     ) -> dict[str, dict[str, Tensor]]:
-        """Construct the registered loss's inputs for one stage from a stored rollout.
+        """Construct the registered loss's inputs for one stage from a stored rollout, drawing under ``keys``.
 
         ``fake_score`` re-noises the rollout endpoint at per-sample critic times and takes no exit
         index. ``student`` re-runs the student with autograd at ``states[exit_index]``.
         """
+        batch = next(iter(trajectory.states[0].values())).shape[0]
+        if len(keys.samples) != batch:
+            raise ValueError(f"The draw keys name {len(keys.samples)} samples for a batch of {batch}")
         if stage == "fake_score":
             if exit_index is not None:
                 raise ValueError("The fake_score stage trains on the rollout endpoint and takes no exit_index")
-            return self._fake_score_outputs(trajectory)
+            return self._fake_score_outputs(trajectory, keys)
         if stage == "student":
-            return self._student_outputs(trajectory, exit_index)
+            return self._student_outputs(trajectory, exit_index, keys)
         raise ValueError(f"Unknown DMD stage {stage!r}")
 
     def compute_loss(
@@ -320,6 +369,7 @@ class DMD2Program:
         loss_function: Callable,
         *,
         exit_index: Optional[int] = None,
+        keys: DrawKeys,
         dp_group: Any = None,
     ) -> tuple[Tensor, dict[str, Any], bool]:
         """Call the registered loss per modality; report nonfinite tensors to the caller.
@@ -333,7 +383,7 @@ class DMD2Program:
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"Caller must supply a positive integer {name} for the public loss wrapper")
         tu.assign_non_tensor(data, dmd_stage=stage, dmd_config=self.config)
-        outputs = self.stage_outputs(trajectory, stage, exit_index)
+        outputs = self.stage_outputs(trajectory, stage, exit_index, keys=keys)
         loss, metrics, invalid = 0, {}, False
         for modality, output in outputs.items():
             part, part_metrics = loss_function(model_output=output, data=data, dp_group=dp_group)
@@ -344,6 +394,6 @@ class DMD2Program:
             metrics.update(critic_teacher_x0_metrics(outputs))
         return loss, metrics, invalid or not bool(torch.isfinite(loss.detach()))
 
-    def sample(self, initial: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Generate final FP32 modality latents without advancing exit-selection RNG."""
-        return self.rollout(initial).states[-1]
+    def sample(self, initial: dict[str, Tensor], *, keys: DrawKeys) -> dict[str, Tensor]:
+        """Generate final FP32 modality latents, drawing under ``keys``."""
+        return self.rollout(initial, keys=keys).states[-1]

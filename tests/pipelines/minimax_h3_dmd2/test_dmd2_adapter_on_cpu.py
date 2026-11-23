@@ -53,8 +53,13 @@ def _record_dit_calls(module) -> list[dict]:
     return calls
 
 
+def generators(batch):
+    """One generator per row, each seeded apart."""
+    return [torch.Generator().manual_seed(100 + row) for row in range(batch)]
+
+
 def _predict(module, data, sigmas, negative=False):
-    latents = MiniMaxH3DMD2.dmd_initial_noise(data)
+    latents = MiniMaxH3DMD2.dmd_initial_noise(data, generators(len(data)))
     condition = MiniMaxH3DMD2.dmd_condition(data)
     with torch.no_grad():
         return MiniMaxH3DMD2.dmd_predict(module, latents, sigmas, condition, negative)
@@ -85,13 +90,15 @@ def test_predictions_are_flow_match_velocities_of_the_dit_output():
 
 
 def test_initial_noise_is_standard_gaussian_fp32_rows_of_the_row_geometry():
-    """Video then audio rows of the microbatch's latent geometry, drawn from the global RNG."""
+    """Video then audio rows of the microbatch's latent geometry; row b draws both from generators[b]."""
     data = micro_batch()
     torch.manual_seed(5)
-    noise = MiniMaxH3DMD2.dmd_initial_noise(data)
-    torch.manual_seed(5)
-    expected_video = torch.randn(2, LATENT_META[0], TINY_VIDEO_ROW_WIDTH, dtype=torch.float32)
-    expected_audio = torch.randn(2, LATENT_META[1], TINY_AUDIO_ROW_WIDTH, dtype=torch.float32)
+    noise = MiniMaxH3DMD2.dmd_initial_noise(data, generators(2))
+    expected_video, expected_audio = [], []
+    for generator in generators(2):
+        expected_video.append(torch.randn(LATENT_META[0], TINY_VIDEO_ROW_WIDTH, generator=generator))
+        expected_audio.append(torch.randn(LATENT_META[1], TINY_AUDIO_ROW_WIDTH, generator=generator))
+    expected_video, expected_audio = torch.stack(expected_video), torch.stack(expected_audio)
 
     assert noise.keys() == {"video", "audio"}
     torch.testing.assert_close(noise["video"], expected_video, rtol=0, atol=0)
@@ -131,7 +138,7 @@ def test_each_role_runs_under_its_adapter_and_the_teacher_is_the_base_model():
     engine = make_dmd_engine(module, config, architecture=ARCHITECTURE)
     calls = _record_dit_calls(module)
     data = micro_batch()
-    latents = MiniMaxH3DMD2.dmd_initial_noise(data)
+    latents = MiniMaxH3DMD2.dmd_initial_noise(data, generators(len(data)))
     sigmas = {"video": torch.tensor([0.9, 0.3]), "audio": torch.tensor([0.4, 0.75])}
 
     outputs, adapters = {}, {}
@@ -184,7 +191,7 @@ def test_a_microbatch_of_two_latent_geometries_is_refused():
     data = micro_batch()
     data["latent_meta"][1, 2] = 2
     with pytest.raises(ValueError, match="one latent geometry per microbatch"):
-        MiniMaxH3DMD2.dmd_initial_noise(data)
+        MiniMaxH3DMD2.dmd_initial_noise(data, generators(len(data)))
 
 
 @pytest.mark.parametrize(

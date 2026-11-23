@@ -26,6 +26,7 @@ from verl.workers.config import FSDPOptimizerConfig
 
 from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.workers.config.diffusion.dmd import DiffusionDMDConfig
+from verl_omni.workers.engine.fsdp import dmd_impl
 from verl_omni.workers.engine.fsdp.diffusers_impl import DiffusersFSDPEngine
 from verl_omni.workers.engine.fsdp.dmd_impl import DMDDiffusersFSDPEngine
 
@@ -64,8 +65,8 @@ class _RecordingDMDModel:
         return micro_batch["prompt_ids"]
 
     @classmethod
-    def dmd_initial_noise(cls, micro_batch: TensorDict) -> dict[str, torch.Tensor]:
-        return {"image": torch.randn(len(micro_batch), 2, 3)}
+    def dmd_initial_noise(cls, micro_batch: TensorDict, generators: list[torch.Generator]) -> dict[str, torch.Tensor]:
+        return {"image": torch.stack([torch.randn(2, 3, generator=generator) for generator in generators])}
 
     @classmethod
     def dmd_predict(cls, module, latents, sigmas, condition, negative) -> dict[str, torch.Tensor]:
@@ -91,6 +92,15 @@ class _RecordingDMDModel:
 RecordingDMDModel = DiffusionModelBase.peek_class(ARCHITECTURE, "dmd2") or DiffusionModelBase.register(
     ARCHITECTURE, algorithm="dmd2"
 )(_RecordingDMDModel)
+
+
+def pin_engine_to_cpu() -> None:
+    """Make the DMD engine put microbatches on the CPU, for a torchrun script of CPU FSDP2 runs.
+
+    The engine moves each microbatch to verl's ``get_device_id()``, an accelerator wherever one is visible. An
+    in-process test patches it with ``monkeypatch`` instead.
+    """
+    dmd_impl.get_device_id = lambda: torch.device("cpu")
 
 
 def optimizer_config(lr: float, lr_warmup_steps: int = -1, **schedule) -> FSDPOptimizerConfig:
@@ -147,6 +157,7 @@ def make_dmd_engine(
         engine.rank = 0
         engine.ulysses_device_mesh = None
         engine.ulysses_sequence_parallel_size = 1
+        engine._is_offload_param = engine._is_offload_optimizer = False
 
     def base_build_model_optimizer(engine):
         engine.module = module

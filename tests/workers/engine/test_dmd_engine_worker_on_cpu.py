@@ -52,12 +52,12 @@ def engine(tmp_path, monkeypatch):
 @pytest.mark.parametrize("stage", ["fake_score", "student"])
 def test_each_metric_holds_one_float_per_microbatch(engine, stage):
     """verl's worker gathers each metric over ranks and flattens the per-rank lists; a bare float breaks that."""
-    for update_stage in ("fake_score", "student")[: 1 + (stage == "student")]:
-        data = TensorDict({"prompt_ids": torch.arange(3).view(-1, 1)}, batch_size=[3])
-        tu.assign_non_tensor(data, dmd_stage=update_stage, use_dynamic_bsz=False)
+    for update, update_stage in enumerate(("fake_score", "student")[: 1 + (stage == "student")]):
+        data = TensorDict({"prompt_ids": torch.arange(3).view(-1, 1), "global_sample": torch.arange(3)}, batch_size=[3])
+        tu.assign_non_tensor(data, dmd_stage=update_stage, dmd_update=update, use_dynamic_bsz=False)
         metrics = engine.train_batch(data, LOSS)["metrics"]
 
-    assert metrics["dmd/nonfinite_outputs"] == [0.0, 0.0, 0.0]
+    assert metrics["dmd/nonfinite_fraction"] == [0.0, 0.0, 0.0]
     for key, values in metrics.items():
         if key == "grad_norm":  # the worker pops it before the gather: it is already the same on every rank
             continue
