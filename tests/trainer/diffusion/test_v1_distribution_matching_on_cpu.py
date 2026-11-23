@@ -15,6 +15,7 @@
 
 import math
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -51,12 +52,20 @@ def make_trainer(metrics: dict[int, dict[str, list[float]]], total_steps: int = 
                 "trainer.v1.trainer_mode=distribution_matching",
                 f"trainer.total_training_steps={total_steps}",
                 "actor_rollout_ref.model.algorithm=dmd2",
+                "actor_rollout_ref.model.model_type=diffusion_dmd_model",
+                "data.train_batch_size=2",
+                "actor_rollout_ref.actor.ppo_mini_batch_size=2",
+                "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",
                 "dmd.fake_update_ratio=5",
             ],
         )
     trainer = get_diffusion_trainer_cls("distribution_matching")(config=config)
-    trainer.actor_rollout_wg = FakeWorkerGroup(metrics)
-    trainer.train_dataloader = [tu.get_tensordict({"prompt_ids": torch.full((2, 3), i)}) for i in range(num_batches)]
+    trainer._build_worker_group = lambda: FakeWorkerGroup(metrics)
+    trainer._build_dataloader = lambda: [
+        tu.get_tensordict({"prompt_ids": torch.full((2, 3), i)}) for i in range(num_batches)
+    ]
+    trainer._build_logger = lambda: SimpleNamespace(log=lambda data, step: None)
+    trainer.init()
     return trainer
 
 

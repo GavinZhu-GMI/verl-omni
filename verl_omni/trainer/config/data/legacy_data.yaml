@@ -64,6 +64,9 @@ shuffle: True
 # Seed to use when shuffling the data
 seed: null
 
+# distribution_matching only: the latent geometries a cached prompt draws from, each the pipeline's latent_meta
+latent_meta_buckets: null
+
 # num dataloader workers
 dataloader_num_workers: 8
 

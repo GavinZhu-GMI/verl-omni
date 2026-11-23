@@ -478,6 +478,7 @@ data:
   return_full_prompt: false
   shuffle: true
   seed: null
+  latent_meta_buckets: null
   dataloader_num_workers: 8
   image_patch_size: 14
   validation_shuffle: false

@@ -185,8 +185,11 @@ class DiffusionTaskRunnerV1:
             trainer_cls = get_diffusion_trainer_cls(config.trainer.v1.trainer_mode)
             self.trainer = trainer_cls(config=config)
             self.trainer.init()
-            self.init_agent_loop_manager()
-            self.trainer.fit(self.agent_loop_manager)
+            if config.trainer.v1.trainer_mode == "distribution_matching":
+                self.trainer.fit()  # the DMD engine samples the student itself: no rollout server, no agent loop
+            else:
+                self.init_agent_loop_manager()
+                self.trainer.fit(self.agent_loop_manager)
         except BaseException as exc:
             primary_error = exc
         finally:

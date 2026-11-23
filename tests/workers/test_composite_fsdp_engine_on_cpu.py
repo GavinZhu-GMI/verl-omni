@@ -104,8 +104,9 @@ class TestCompositeEngineRegistry:
 
         from verl_omni.workers import engine_workers
 
+        assert "diffusion_composite_model" in engine_workers.DIFFUSION_MODEL_TYPES
         init_model_src = inspect.getsource(engine_workers.ActorRolloutRefWorker.init_model)
-        assert "diffusion_composite_model" in init_model_src
+        assert "in DIFFUSION_MODEL_TYPES" in init_model_src
 
 
 class TestBuildARHfModelConfig:

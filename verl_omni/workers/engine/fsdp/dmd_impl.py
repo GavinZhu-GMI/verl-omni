@@ -26,6 +26,7 @@ from verl.utils.device import get_device_id
 from verl.utils.metric import Metric
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig
 from verl.workers.config.optimizer import build_optimizer
+from verl.workers.engine import EngineRegistry
 
 from verl_omni.pipelines.dmd2.program import DMD2Program, Trajectory
 from verl_omni.pipelines.model_base import DiffusionModelBase
@@ -34,7 +35,9 @@ from verl_omni.workers.config.diffusion.dmd import check_constant_learning_rate
 from verl_omni.workers.engine.fsdp.diffusers_impl import DiffusersFSDPEngine
 from verl_omni.workers.engine.lora_adapter_mixin import adapter_parameters
 
-__all__ = ["DMDDiffusersFSDPEngine"]
+__all__ = ["DMD_MODEL_TYPE", "DMDDiffusersFSDPEngine"]
+
+DMD_MODEL_TYPE = "diffusion_dmd_model"  # the engine registry key of the DMD engine
 
 _STAGE_ADAPTERS = {"fake_score": "fake_score", "student": "default"}  # the adapter each DMD stage trains
 _ADAPTER_STAGES = {adapter: stage for stage, adapter in _STAGE_ADAPTERS.items()}
@@ -49,6 +52,7 @@ class _AdapterOptimizer:
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler
 
 
+@EngineRegistry.register(model_type=DMD_MODEL_TYPE, backend="fsdp2")  # the registry's default device
 class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
     """Run DMD2 fake_score and student updates on LoRA adapters of one frozen base, one update per ``train_batch``.
 
@@ -312,7 +316,7 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
             micro_metrics["dmd/nonfinite_outputs"] = float(invalid)
             for key, value in micro_metrics.items():
                 value = value.aggregate() if isinstance(value, Metric) else value
-                metrics[key] = metrics.get(key, 0.0) + float(value) / slots
+                metrics.setdefault(key, []).append(float(value))  # one value per microbatch, as verl's engines
         if stage == "fake_score":
             self._kept_rollouts = slot_inputs
         return {"loss": losses, "metrics": metrics, "model_output": {}}

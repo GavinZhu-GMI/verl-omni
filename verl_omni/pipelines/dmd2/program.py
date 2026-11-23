@@ -34,7 +34,7 @@ from verl.utils import tensordict_utils as tu
 from verl_omni.trainer.diffusion.distillation.utils import standard_cfg, velocity_to_x0
 from verl_omni.workers.config.diffusion.dmd import DiffusionDMDConfig
 
-__all__ = ["DMD2Program", "Trajectory", "training_grid"]
+__all__ = ["DMD2Program", "Trajectory", "critic_teacher_x0_metrics", "training_grid"]
 
 
 @dataclass
@@ -64,6 +64,21 @@ def training_grid(config: DiffusionDMDConfig, device: torch.device) -> dict[str,
     return {
         name: (shift * knots / (1 + (shift - 1) * knots)).float().to(device)
         for name, shift in config.modality_shifts.items()
+    }
+
+
+def critic_teacher_x0_metrics(outputs: dict[str, dict[str, Tensor]]) -> dict[str, Tensor]:
+    """How far the fake score's clean estimate is from the teacher's at the student's score queries.
+
+    Every modality's ``fake_x0`` and ``teacher_x0`` ``(B, ...)`` count, concatenated per sample in FP32, without
+    modality weights. ``dmd/critic_teacher_x0_gap`` is the per-sample L2 norm of ``fake_x0 - teacher_x0``, averaged
+    over samples; ``dmd/critic_teacher_x0_equal`` is the fraction of elements where the two are exactly equal.
+    """
+    fake = torch.cat([output["fake_x0"].detach().float().flatten(1) for output in outputs.values()], dim=1)
+    teacher = torch.cat([output["teacher_x0"].detach().float().flatten(1) for output in outputs.values()], dim=1)
+    return {
+        "dmd/critic_teacher_x0_gap": (fake - teacher).norm(dim=1).mean(),
+        "dmd/critic_teacher_x0_equal": (fake == teacher).float().mean(),
     }
 
 
@@ -325,6 +340,8 @@ class DMD2Program:
             loss = loss + self.config.modality_weights[modality] * part
             metrics.update({f"{modality}/{key}": value for key, value in part_metrics.items()})
             invalid |= any(not bool(torch.isfinite(value).all()) for value in output.values())
+        if stage == "student":
+            metrics.update(critic_teacher_x0_metrics(outputs))
         return loss, metrics, invalid or not bool(torch.isfinite(loss.detach()))
 
     def sample(self, initial: dict[str, Tensor]) -> dict[str, Tensor]:

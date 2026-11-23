@@ -69,11 +69,13 @@ from verl_omni.utils.mfu import (
 )
 from verl_omni.workers.config import (
     DiffusionActorConfig,
+    DiffusionDMDConfig,
     DiffusionModelConfig,
     OmniModelConfig,
 )
 from verl_omni.workers.config.diffusion import DiffusionDistillationTeacherModelConfig
 from verl_omni.workers.config.omni.distillation import HIDDEN_STATE_LOSS_MODES
+from verl_omni.workers.engine.fsdp.dmd_impl import DMD_MODEL_TYPE
 from verl_omni.workers.lora_sync import SyncExport, resolve_lora_sync_plan
 from verl_omni.workers.rollout.base import get_rollout_sequence_parallel_size
 from verl_omni.workers.rollout.vllm_rollout.zmq_utils import make_update_zmq_handle, make_update_zmq_id
@@ -81,6 +83,15 @@ from verl_omni.workers.utils.losses import diffusion_loss, omni_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+# the model types whose engines train a diffusion model
+DIFFUSION_MODEL_TYPES = (
+    "diffusion_model",
+    "diffusion_composite_model",
+    "diffusion_dpo_model",
+    "diffusion_nft_model",
+    DMD_MODEL_TYPE,
+)
 
 
 def _get_engine_lora_config(engine, adapter_name: str = "default") -> dict | None:
@@ -152,7 +163,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
     and do not provide exact APIs as Tinker does. But this can be added in the future.
     """
 
-    def __init__(self, config: TrainingWorkerConfig):
+    def __init__(self, config: TrainingWorkerConfig, dmd_config: Optional[DiffusionDMDConfig] = None):
         Worker.__init__(self)
 
         from verl.workers.engine import BaseEngine, EngineRegistry
@@ -201,6 +212,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
         )
 
         self.model_config.model_type = self.config.model_type
+        # only the DMD engine takes a dmd_config; it builds its DMD program before the model loads
+        if (self.config.model_type == DMD_MODEL_TYPE) != (dmd_config is not None):
+            raise ValueError(f"dmd_config is required for model_type={DMD_MODEL_TYPE!r} and only for it.")
+        engine_kwargs = {} if dmd_config is None else {"dmd_config": dmd_config}
         self.engine: BaseEngine = EngineRegistry.new(
             model_type=self.config.model_type,
             backend=self.engine_config.strategy,
@@ -208,6 +223,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             engine_config=self.engine_config,
             optimizer_config=self.optimizer_config,
             checkpoint_config=self.checkpoint_config,
+            **engine_kwargs,
         )
 
         # build dispatch info
@@ -219,12 +235,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         if getattr(self.model_config, "hf_config", None) is not None:
             self.flops_counter = FlopsCounter(self.model_config.hf_config)
-        elif self.config.model_type in (
-            "diffusion_model",
-            "diffusion_composite_model",
-            "diffusion_dpo_model",
-            "diffusion_nft_model",
-        ):
+        elif self.config.model_type in DIFFUSION_MODEL_TYPES:
             self.flops_counter = DiffusionFlopsCounter(
                 architecture=getattr(self.model_config, "architecture", None),
                 transformer_config=getattr(self.model_config, "transformer_config", None),
@@ -624,11 +635,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         role: str,
         distillation_config: Optional[DistillationConfig] = None,
         teacher_key: Optional[str] = None,
+        dmd_config: Optional[DictConfig] = None,
         **kwargs,
     ):
         Worker.__init__(self)
         self.config = config
         self.distillation_config = distillation_config
+        self.dmd_config = dmd_config
         self.distillation_enabled = is_distillation_enabled(distillation_config)
         self.teacher_key = teacher_key
         self.role = role
@@ -680,12 +693,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         model_config: HFModelConfig | DiffusionModelConfig | OmniModelConfig = omega_conf_to_dataclass(
             self.config.model
         )
-        is_diffusion = model_config.get("model_type", "language_model") in (
-            "diffusion_model",
-            "diffusion_composite_model",
-            "diffusion_dpo_model",
-            "diffusion_nft_model",
-        )
+        is_diffusion = model_config.get("model_type", "language_model") in DIFFUSION_MODEL_TYPES
 
         # 1. build reference model
         if "ref" in self.role:
@@ -826,7 +834,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     )
             else:
                 self.loss_fn = partial(ppo_loss, config=actor_config)
-            self.actor = TrainingWorker(config=actor_training_config)
+            if actor_training_config.model_type == DMD_MODEL_TYPE:
+                # omega_conf_to_dataclass turns None into a default config, which DMD must not train on
+                if self.dmd_config is None:
+                    raise ValueError(f"An actor of model_type={DMD_MODEL_TYPE!r} needs dmd_config.")
+                dmd_config = omega_conf_to_dataclass(self.dmd_config, DiffusionDMDConfig)
+                self.actor = TrainingWorker(config=actor_training_config, dmd_config=dmd_config)
+            else:
+                self.actor = TrainingWorker(config=actor_training_config)
             self.actor.reset()
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
