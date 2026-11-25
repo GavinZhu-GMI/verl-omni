@@ -13,11 +13,16 @@
 # limitations under the License.
 """MiniMax H3 training adapter for DMD2 / PDMD distillation, text to video and audio."""
 
+import math
 from dataclasses import dataclass
 
 import torch
 from diffusers import ModelMixin
 from tensordict import TensorDict
+from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
+    minimax_h3_pack_audio_latent,
+    minimax_h3_patchify_video_latent,
+)
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     AUDIO_ROW_WIDTH,
@@ -34,6 +39,7 @@ __all__ = ["MiniMaxH3DMD2"]
 
 _CONDITION_KEYS = ("prompt_embeds", "prompt_embeds_mask", "prompt_token_tags", "latent_meta")
 _MEDIA_CONDITION_KEYS = ("condition_video_rows", "condition_audio_rows", "keyframe_frame_indices", "ref_block_meta")
+_VIDEO_PATCH_SIZE = (1, 2, 2)  # the H3 DiT's (T, H, W) patch, which packs latents into video rows
 
 
 @dataclass
@@ -54,6 +60,31 @@ def _latent_meta(micro_batch: TensorDict) -> tuple[int, ...]:
     if not torch.all(latent_meta == latent_meta[0]):
         raise ValueError("MiniMax H3 DMD needs one latent geometry per microbatch; bucket the rows by latent_meta.")
     return tuple(int(value) for value in latent_meta[0].tolist())
+
+
+def _latent_noise(
+    latent_meta: tuple[int, ...], generators: list[torch.Generator], device: torch.device
+) -> dict[str, torch.Tensor]:
+    """Draw each row's video latent ``(1, C, T, H, W)`` and then its audio latent ``(A, D, T_audio)`` from its
+    generator, and pack both into rows, as the PDMD reference draws its noise (https://github.com/ZeamoxWang/pdmd
+    at 6b6e106, ``src/pdmd/backend.py:56-62``)."""
+    _, audio_rows, frames, height, width, audio_t = latent_meta
+    video_channels = VIDEO_ROW_WIDTH // math.prod(_VIDEO_PATCH_SIZE)
+    rows = []
+    for generator in generators:
+        video = torch.randn(
+            (1, video_channels, frames, height, width), generator=generator, device=device, dtype=torch.float32
+        )
+        audio = torch.randn(
+            (audio_rows // audio_t, AUDIO_ROW_WIDTH, audio_t), generator=generator, device=device, dtype=torch.float32
+        )
+        rows.append(
+            (
+                minimax_h3_patchify_video_latent(video, patch_size=_VIDEO_PATCH_SIZE),
+                minimax_h3_pack_audio_latent(audio),
+            )
+        )
+    return {"video": torch.stack([video for video, _ in rows]), "audio": torch.stack([audio for _, audio in rows])}
 
 
 @DiffusionModelBase.register("MiniMaxH3Pipeline", algorithm="dmd2")
@@ -92,7 +123,7 @@ class MiniMaxH3DMD2(DiffusionModelBase):
     def dmd_initial_noise(cls, micro_batch: TensorDict, generators: list[torch.Generator]) -> dict[str, torch.Tensor]:
         """Standard Gaussian FP32 video and audio rows of the microbatch's latent geometry, on its device.
 
-        Row ``b`` draws its video, then its audio, from ``generators[b]``.
+        Row ``b`` draws its video latent, then its audio latent, from ``generators[b]``; both are packed into rows.
 
         Raises:
             ValueError: ``generators`` does not hold one generator per row.
@@ -101,14 +132,15 @@ class MiniMaxH3DMD2(DiffusionModelBase):
         device = micro_batch["latent_meta"].device
         if len(generators) != len(micro_batch):
             raise ValueError(f"dmd_initial_noise needs one generator per row: {len(generators)} for {len(micro_batch)}")
-        rows = [
-            (
-                torch.randn(latent_meta[0], VIDEO_ROW_WIDTH, generator=generator, device=device, dtype=torch.float32),
-                torch.randn(latent_meta[1], AUDIO_ROW_WIDTH, generator=generator, device=device, dtype=torch.float32),
-            )
-            for generator in generators
-        ]
-        return {"video": torch.stack([video for video, _ in rows]), "audio": torch.stack([audio for _, audio in rows])}
+        return _latent_noise(latent_meta, generators, device)
+
+    @classmethod
+    def dmd_noise(
+        cls, condition: H3TextCondition, generators: list[torch.Generator], device: torch.device
+    ) -> dict[str, torch.Tensor]:
+        """Standard Gaussian FP32 video and audio rows of ``condition``'s latent geometry, one row per generator,
+        drawn as :meth:`dmd_initial_noise` draws them."""
+        return _latent_noise(condition.latent_meta, generators, device)
 
     @classmethod
     def dmd_predict(

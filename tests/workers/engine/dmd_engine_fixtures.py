@@ -69,6 +69,12 @@ class _RecordingDMDModel:
         return {"image": torch.stack([torch.randn(2, 3, generator=generator) for generator in generators])}
 
     @classmethod
+    def dmd_noise(cls, condition, generators: list[torch.Generator], device) -> dict[str, torch.Tensor]:
+        return {
+            "image": torch.stack([torch.randn(2, 3, generator=generator, device=device) for generator in generators])
+        }
+
+    @classmethod
     def dmd_predict(cls, module, latents, sigmas, condition, negative) -> dict[str, torch.Tensor]:
         lora_layers = [layer for layer in module.modules() if isinstance(layer, BaseTunerLayer)]
         (active,) = {layer.active_adapters[0] for layer in lora_layers}

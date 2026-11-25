@@ -226,7 +226,7 @@ class TestDMDConfig:
         assert omega_conf_to_dataclass(config.dmd).fake_update_ratio == 3
 
     def test_pdmd_program_overrides_compose_from_yaml(self):
-        from verl_omni.pipelines.dmd2.program import DMD2Program
+        from verl_omni.pipelines.dmd2.program import DMD2Program, standard_noise
 
         config = compose_config(
             [
@@ -245,7 +245,7 @@ class TestDMDConfig:
         assert dmd.sampler == "renoise"
         assert dmd.base_time_knots == [1.0, 0.75, 0.5, 0.25, 0.1, 0.04, 0.0]
         assert dmd.critic_time_lead_modality == "video"
-        program = DMD2Program(dmd, lambda role, latents, sigmas, negative: latents, seed=42)
+        program = DMD2Program(dmd, lambda role, latents, sigmas, negative: latents, seed=42, draw_noise=standard_noise)
         assert program.config is dmd
 
     @pytest.mark.parametrize("schedule", ["inline", "one_step_off"])

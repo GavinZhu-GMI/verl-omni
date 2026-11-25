@@ -68,7 +68,9 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
     trained adapter. FSDP2 only: each adapter clips its own gradients.
 
     The ``(architecture, dmd2)`` adapter registered for the model config supplies ``dmd_condition(micro_batch)``,
-    ``dmd_initial_noise(micro_batch, generators)`` and ``dmd_predict(module, latents, sigmas, condition, negative)``.
+    ``dmd_initial_noise(micro_batch, generators)``, ``dmd_noise(condition, generators, device)`` and
+    ``dmd_predict(module, latents, sigmas, condition, negative)``. ``dmd_noise`` draws every noise past the initial
+    one, in the adapter's own draw layout.
     """
 
     def __init__(
@@ -90,7 +92,7 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
         # the architecture adapter and the DMD program, before the model loads
         self.dmd_config = dmd_config
         self._model_adapter = DiffusionModelBase.get_class(model_config)
-        self._program = DMD2Program(dmd_config, self._predict, engine_config.seed)
+        self._program = DMD2Program(dmd_config, self._predict, engine_config.seed, draw_noise=self._draw_noise)
         self._condition: Any = _NO_CONDITION
         # the last fake_score update's rollout, condition and microbatch, by slot; None until one update keeps them
         self._kept_rollouts: Optional[list[tuple[Trajectory, Any, TensorDict]]] = None
@@ -289,6 +291,16 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
             raise RuntimeError("A DMD prediction ran outside a _conditioned context, so it has no condition.")
         with self.use_adapter(_ROLE_ADAPTERS[role]):
             return self._model_adapter.dmd_predict(self.module, latents, sigmas, self._condition, negative)
+
+    def _draw_noise(self, generators: list[torch.Generator], like: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Draw noise for ``like`` from the adapter, on the condition of the open ``_conditioned`` context.
+
+        Raises:
+            RuntimeError: No ``_conditioned`` context is open.
+        """
+        if self._condition is _NO_CONDITION:
+            raise RuntimeError("A DMD noise draw ran outside a _conditioned context, so it has no condition.")
+        return self._model_adapter.dmd_noise(self._condition, generators, next(iter(like.values())).device)
 
     @staticmethod
     def _stage_of(data: TensorDict) -> str:

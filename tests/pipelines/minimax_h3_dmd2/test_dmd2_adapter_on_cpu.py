@@ -16,6 +16,10 @@
 import pytest
 import torch
 from peft.tuners.tuners_utils import BaseTunerLayer
+from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
+    minimax_h3_pack_audio_latent,
+    minimax_h3_patchify_video_latent,
+)
 
 import verl_omni.pipelines
 from tests.pipelines.minimax_h3_dmd2.h3_dmd2_fixtures import (
@@ -90,14 +94,18 @@ def test_predictions_are_flow_match_velocities_of_the_dit_output():
 
 
 def test_initial_noise_is_standard_gaussian_fp32_rows_of_the_row_geometry():
-    """Video then audio rows of the microbatch's latent geometry; row b draws both from generators[b]."""
+    """Video then audio latents of the microbatch's latent geometry, packed into rows; row b draws both from
+    generators[b]."""
     data = micro_batch()
     torch.manual_seed(5)
     noise = MiniMaxH3DMD2.dmd_initial_noise(data, generators(2))
+    _, audio_rows, frames, height, width, audio_t = LATENT_META
     expected_video, expected_audio = [], []
     for generator in generators(2):
-        expected_video.append(torch.randn(LATENT_META[0], TINY_VIDEO_ROW_WIDTH, generator=generator))
-        expected_audio.append(torch.randn(LATENT_META[1], TINY_AUDIO_ROW_WIDTH, generator=generator))
+        video = torch.randn((1, TINY_VIDEO_ROW_WIDTH // 4, frames, height, width), generator=generator)
+        audio = torch.randn((audio_rows // audio_t, TINY_AUDIO_ROW_WIDTH, audio_t), generator=generator)
+        expected_video.append(minimax_h3_patchify_video_latent(video, patch_size=(1, 2, 2)))
+        expected_audio.append(minimax_h3_pack_audio_latent(audio))
     expected_video, expected_audio = torch.stack(expected_video), torch.stack(expected_audio)
 
     assert noise.keys() == {"video", "audio"}

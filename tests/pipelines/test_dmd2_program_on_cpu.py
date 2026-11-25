@@ -22,7 +22,7 @@ import torch
 from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 
-from verl_omni.pipelines.dmd2.program import DMD2Program, Trajectory
+from verl_omni.pipelines.dmd2.program import DMD2Program, Trajectory, standard_noise
 from verl_omni.trainer.diffusion.distillation.utils import dmd_gradient, dmd_surrogate_loss
 from verl_omni.workers.config.diffusion.actor import DiffusionActorConfig, DiffusionLossConfig
 from verl_omni.workers.config.diffusion.dmd import DiffusionDMDConfig
@@ -71,7 +71,7 @@ def make_program(modalities=("image",), *, device="cpu", batch=2, **overrides):
         name: torch.linspace(-1, 1, batch * (index + 2) * 3).reshape(batch, index + 2, 3).to(device)
         for index, name in enumerate(modalities)
     }
-    return DMD2Program(config, predict, seed=42), models, initial, calls
+    return DMD2Program(config, predict, seed=42, draw_noise=standard_noise), models, initial, calls
 
 
 def keys_of(program, latents, update=0):
@@ -105,7 +105,7 @@ def linear_program(sampler, *, knots=None, steps=4, shift=2.0):
         sigma = sigmas["image"].view(-1, *([1] * (latents["image"].ndim - 1)))
         return {"image": 0.5 * latents["image"] + 0.1 * sigma}
 
-    return DMD2Program(config, predict, seed=3), calls
+    return DMD2Program(config, predict, seed=3, draw_noise=standard_noise), calls
 
 
 # shift 2 on linspace(1, 0, 5): 2t / (1 + t)

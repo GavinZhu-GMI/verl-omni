@@ -26,7 +26,7 @@ must ensure the feature axis is last. CFG on unpacked latents requires `"none"` 
 A minimal configuration for packed image latents:
 
 ```python
-from verl_omni.pipelines.dmd2.program import DMD2Program
+from verl_omni.pipelines.dmd2.program import DMD2Program, standard_noise
 from verl_omni.workers.config.diffusion.dmd import DiffusionDMDConfig
 
 config = DiffusionDMDConfig(
@@ -34,8 +34,12 @@ config = DiffusionDMDConfig(
     modality_shifts={"image": 3.0},
     modality_weights={"image": 1.0},
 )
-program = DMD2Program(config, predict, seed=42)
+program = DMD2Program(config, predict, seed=42, draw_noise=standard_noise)
 ```
+
+`draw_noise` draws every noise past the initial one. `standard_noise` draws each row in its packed shape; a model
+whose reference draws latents and then packs them passes a drawer that does the same, as the DMD engine does
+through its adapter's `dmd_noise`.
 
 The shared YAML defaults to `score_discrete_steps=1000`, so callers must override it
 to `0` and supply both modality dictionaries. Hydra needs `+` for new dictionary
@@ -103,6 +107,7 @@ With the repository's normal dependencies installed, run the CPU tests with:
 
 ```bash
 pytest -q tests/pipelines/test_dmd2_program_on_cpu.py \
+  tests/pipelines/test_dmd2_critic_sigma_parity_on_cpu.py \
   tests/trainer/diffusion/test_dmd_config_on_cpu.py \
   tests/trainer/diffusion/test_dmd_loss_on_cpu.py \
   tests/trainer/diffusion/test_distillation_utils_on_cpu.py

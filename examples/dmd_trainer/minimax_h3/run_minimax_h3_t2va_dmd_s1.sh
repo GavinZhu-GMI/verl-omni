@@ -65,6 +65,7 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.lora_rank=128 \
     actor_rollout_ref.model.lora_alpha=128 \
+    actor_rollout_ref.model.lora_init_weights=true \
     actor_rollout_ref.model.policy_state_adapters='["default","fake_score"]' \
     actor_rollout_ref.model.target_modules="$h3_lora_targets" \
     actor_rollout_ref.model.fsdp_layer_prefixes="['transformer_blocks.','token_refiner.refiner_blocks.']" \

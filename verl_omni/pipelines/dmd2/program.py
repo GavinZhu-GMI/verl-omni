@@ -40,7 +40,15 @@ from verl_omni.trainer.diffusion.distillation.utils import standard_cfg, velocit
 from verl_omni.utils.dataset.prompt_stream import stream_seed
 from verl_omni.workers.config.diffusion.dmd import DiffusionDMDConfig
 
-__all__ = ["DMD2Program", "DrawKeys", "Trajectory", "critic_teacher_x0_metrics", "training_grid"]
+__all__ = [
+    "DMD2Program",
+    "DrawKeys",
+    "NoiseDrawer",
+    "Trajectory",
+    "critic_teacher_x0_metrics",
+    "standard_noise",
+    "training_grid",
+]
 
 
 @dataclass(frozen=True)
@@ -62,9 +70,14 @@ class DrawKeys:
         ]
 
 
-def _randn(generators: list[torch.Generator], like: dict[str, Tensor]) -> dict[str, Tensor]:
-    """Standard Gaussian FP32 noise shaped as each modality of ``like`` ``(B, ...)``; row ``b`` draws from
-    ``generators[b]``, its modalities in ``like``'s order."""
+NoiseDrawer = Callable[[list[torch.Generator], dict[str, Tensor]], dict[str, Tensor]]
+"""``draw_noise(generators, like)``: standard Gaussian FP32 noise with ``like``'s keys, shapes and device; row ``b``
+draws from ``generators[b]`` alone."""
+
+
+def standard_noise(generators: list[torch.Generator], like: dict[str, Tensor]) -> dict[str, Tensor]:
+    """A :data:`NoiseDrawer` for latents whose draw layout is their own: each row is drawn in its ``like`` shape,
+    modalities in ``like``'s order."""
     device = next(iter(like.values())).device
     rows = [
         {
@@ -154,6 +167,9 @@ class DMD2Program:
             unconditional teacher inputs for CFG. With teacher ``layer_norm`` CFG, inputs and
             outputs must be packed ``(B, tokens, features)``.
         seed: The seed of every draw key; every rank of a run passes the same one.
+        draw_noise: The :data:`NoiseDrawer` of every noise draw past the initial noise: the ``renoise`` sampler's,
+            the critic's fresh noise and the fresh score-query noise. A model whose latents are packed draws in its
+            latent layout and packs, so that its draws equal its reference's.
 
     Forward/recompute contexts and gradient reduction remain caller-owned.
     """
@@ -163,6 +179,8 @@ class DMD2Program:
         config: DiffusionDMDConfig,
         predict: Callable[[str, dict[str, Tensor], dict[str, Tensor], bool], dict[str, Tensor]],
         seed: int,
+        *,
+        draw_noise: NoiseDrawer,
     ):
         if config.score_discrete_steps != 0:
             raise ValueError("DMD2Program supports continuous score sampling only; set score_discrete_steps=0")
@@ -174,6 +192,7 @@ class DMD2Program:
         self.config = config
         self.predict = predict
         self.seed = seed
+        self.draw_noise = draw_noise
 
     def keys(self, update: int, samples: tuple[int, ...]) -> DrawKeys:
         """The draw keys of a microbatch whose rows are global ``samples`` of 0-based ``update``."""
@@ -183,6 +202,15 @@ class DMD2Program:
         """The student exit index of 0-based ``update``; every microbatch and rank of the update shares it."""
         generator = torch.Generator().manual_seed(stream_seed(self.seed, "exit", update))
         return int(torch.randint(self.config.num_inference_steps, (1,), generator=generator))
+
+    def _checked_noise(self, generators: list[torch.Generator], like: dict[str, Tensor]) -> dict[str, Tensor]:
+        noise = self.draw_noise(generators, like)
+        if noise.keys() != like.keys() or any(
+            noise[name].shape != value.shape or noise[name].dtype != torch.float32 or noise[name].device != value.device
+            for name, value in like.items()
+        ):
+            raise ValueError("draw_noise must return FP32 noise with the latents' keys, shapes and device")
+        return noise
 
     def _predict(
         self, role: str, latents: dict[str, Tensor], sigmas: dict[str, Tensor], negative: bool = False
@@ -236,7 +264,7 @@ class DMD2Program:
                 }
             elif self.config.sampler == "renoise":
                 clean = {name: value - current[name] * velocities[name].float() for name, value in state.items()}
-                noise = _randn(generators, clean)
+                noise = self._checked_noise(generators, clean)
                 state = {
                     name: (1 - following[name]) * value + following[name] * noise[name] for name, value in clean.items()
                 }
@@ -253,18 +281,23 @@ class DMD2Program:
         if self.config.critic_time == "uniform":
             lead = self.config.critic_time_lead_modality or names[0]
             followers = [name for name in names if name != lead]
-            # per row: the lead's sigma, then a draw and a redraw per follower
+            # per row: the lead's sigma, then a draw and a redraw per follower, drawn and compared in FP64 as the PDMD
+            # reference does (``critic_times``, https://github.com/ZeamoxWang/pdmd at 6b6e106,
+            # ``src/pdmd/schedule.py:45-56``); each sigma is cast to FP32 last
             uniforms = torch.stack(
-                [torch.rand(1 + 2 * len(followers), generator=generator) for generator in generators]
+                [
+                    torch.rand(1 + 2 * len(followers), generator=generator, dtype=torch.float64)
+                    for generator in generators
+                ]
             )
             lead_sigma = uniforms[:, 0]
-            sigmas = {lead: lead_sigma}
+            sigmas = {lead: lead_sigma.float()}
             floor = self.config.critic_time_follower_floor
             for position, name in enumerate(followers):
                 draw, redraw = uniforms[:, 1 + 2 * position], uniforms[:, 2 + 2 * position]
                 sigmas[name] = torch.where(
                     lead_sigma > self.config.critic_time_lead_threshold, floor + (1 - floor) * redraw, draw
-                )
+                ).float()
         elif self.config.critic_time == "query_matched":
             steps = self.config.num_inference_steps
             step = torch.cat([torch.randint(steps, (1,), generator=generator) for generator in generators]).to(device)
@@ -278,7 +311,7 @@ class DMD2Program:
         endpoint = trajectory.states[-1]
         sigmas = self._critic_sigmas(trajectory, keys)
         if self.config.critic_noise == "fresh":
-            noise = _randn(keys.generators("renoise", next(iter(endpoint.values())).device), endpoint)
+            noise = self._checked_noise(keys.generators("renoise", next(iter(endpoint.values())).device), endpoint)
         elif self.config.critic_noise == "trajectory":
             noise = trajectory.states[0]
         else:
@@ -323,7 +356,7 @@ class DMD2Program:
             elif self.config.score_query_noise == "trajectory":
                 noise = trajectory.states[0]
             elif self.config.score_query_noise == "fresh":
-                noise = _randn(keys.generators("score_query", device), clean)
+                noise = self._checked_noise(keys.generators("score_query", device), clean)
             else:
                 raise ValueError(f"Unknown score_query_noise {self.config.score_query_noise!r}")
             query = {name: _renoise(value.detach(), noise[name], query_sigmas[name]) for name, value in clean.items()}
